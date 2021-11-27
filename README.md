@@ -1,5 +1,4 @@
-# Python 3 Mini Project
-> Image Steganography using Python3
+# Python 3 Image Steganography
 
 ## Folder Structure
  | Folder | Description | 
@@ -7,10 +6,6 @@
  | 1_Implementation | All code and documentation | 
  | 2_ImagesAndVideos | Screenshots and Demonstration video of the Project | 
 
- ## Contributor List
- | SFID | Name |
- |---|---|
- |293645| Palaash Atri| 
 
  ## Working
 * Install Python 3 and pip3 : [Windows](https://www.python.org/downloads/) | [Linux](https://www.tecmint.com/install-pip-in-linux/)
