@@ -1,17 +1,74 @@
 # Python 3 Image Steganography
 
+CLI tool for LSB image steganography with optional AES-256-GCM protection, fixed headers, and capacity checks.
+
 ## Folder Structure
- | Folder | Description | 
- |---|---|
- | 1_Implementation | All code and documentation | 
- | 2_ImagesAndVideos | Screenshots and Demonstration video of the Project | 
+| Folder | Description |
+|---|---|
+| 1_Implementation | All code |
+| 2_ImagesAndVideos | Screenshots and demo video |
 
+## Setup
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
- ## Working
-* Install Python 3 and pip3 : [Windows](https://www.python.org/downloads/) | [Linux](https://www.tecmint.com/install-pip-in-linux/)
-* Install PIL/Pillow library : `pip install pillow` or `pip3 install pillow`
-* Move to the `1_Implementation` directory and use `python app.py` or `python3 app.py` to run the application
+## Methods
+- **lsb:** Basic sequential LSB substitution.
+- **lsb-prng:** Pixels selected via PRNG permutation using `--prng-key`.
+- **lsb-match-prng:** LSB matching (±1) with PRNG permutation.
 
- ## Resources
- * Steganography - [Wikipedia]()
- * Python Image Library (PIL) - [Wikipedia](https://en.wikipedia.org/wiki/Python_Imaging_Library) | [Official Website](https://python-pillow.org/) |[Tutorial Examples](https://gethowstuff.com/python-pillow-pil-tutorial-examples/)
+Use lossless formats (PNG) for outputs; JPEG recompression will destroy hidden data.
+
+## Usage
+
+Encode a message into an image (basic LSB):
+```bash
+python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb
+```
+
+Encode with PRNG permutation:
+```bash
+python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-prng --prng-key "my-key"
+```
+
+Encode with LSB matching + PRNG:
+```bash
+python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-match-prng --prng-key "my-key"
+```
+
+Optional encryption:
+```bash
+python 1_Implementation/app.py encode --image cover.png --out secret.png --in-file notes.txt --password "strong passphrase"
+```
+
+Decode to stdout (basic LSB):
+```bash
+python 1_Implementation/app.py decode --image secret.png --method lsb
+```
+
+Decode (PRNG-based):
+```bash
+python 1_Implementation/app.py decode --image secret.png --method lsb-prng --prng-key "my-key"
+# or for LSB matching
+python 1_Implementation/app.py decode --image secret.png --method lsb-match-prng --prng-key "my-key"
+```
+
+Decode to a file:
+```bash
+python 1_Implementation/app.py decode --image secret.png --out recovered.bin --method lsb
+```
+
+Add `--verbose` to see debug logging.
+
+## Run script (macOS)
+```bash
+./run.sh encode --image cover.png --out secret.png --message "hi" --method lsb
+./run.sh decode --image secret.png --method lsb
+```
+
+## Resources
+* Steganography - [Wikipedia](https://en.wikipedia.org/wiki/Steganography)
+* Python Image Library (Pillow) - [Website](https://python-pillow.org/)
