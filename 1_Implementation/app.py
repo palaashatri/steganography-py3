@@ -11,6 +11,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import base64
 import logging
 import os
 import random
@@ -22,6 +23,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PIL import Image
+from mutagen.id3 import ID3, APIC, TIT2, TPE1
+from mutagen.mp4 import MP4
 
 
 MAGIC = b"STG1"
@@ -29,6 +32,9 @@ VERSION = 1
 FLAG_ENCRYPTED = 0b0000_0001
 FLAG_PRNG = 0b0000_0010
 FLAG_LSB_MATCH = 0b0000_0100
+FLAG_PAYLOAD_IMAGE = 0b0000_1000  # Payload is image data (MP3/MP4 only)
+FLAG_PAYLOAD_TEXT = 0b0001_0000   # Payload is text/file data (MP3/MP4 only)
+FLAG_PAYLOAD_MP3 = 0b0010_0000    # Payload is MP3 file (MP4 only)
 
 DEFAULT_SALT_LEN = 16
 DEFAULT_NONCE_LEN = 12
@@ -214,6 +220,362 @@ def load_image(path: str) -> Image.Image:
     return img
 
 
+def load_mp3(path: str) -> None:
+    """Load and validate MP3 file exists."""
+    try:
+        with open(path, "rb") as f:
+            pass
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MP3 file not found: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not open MP3 file '{path}': {exc}") from exc
+
+
+def embed_data_in_mp3(mp3_path: str, output_path: str, password: str | None = None, 
+                      message: str | None = None, in_file: str | None = None, 
+                      image_path: str | None = None) -> None:
+    """Embed text/file data or image into an MP3 file using ID3 tags with optional encryption."""
+    import shutil
+    
+    load_mp3(mp3_path)
+    
+    # Determine payload type
+    payload_count = sum([message is not None, in_file is not None, image_path is not None])
+    if payload_count == 0:
+        raise ValueError("Provide --message, --in-file, or --image")
+    if payload_count > 1:
+        raise ValueError("Provide only one of: --message, --in-file, or --image")
+    
+    flags = 0
+    salt = b""
+    nonce = b""
+    plaintext = b""
+    metadata = b""  # Additional metadata after payload
+    
+    if image_path:
+        # Handle image embedding
+        flags |= FLAG_PAYLOAD_IMAGE
+        image = load_image(image_path)
+        
+        # Convert image to bytes
+        image_bytes = bytearray()
+        for pixel in image.getdata():
+            image_bytes.extend(pixel)
+        plaintext = bytes(image_bytes)
+        
+        # Store image dimensions in metadata
+        metadata = image.size[0].to_bytes(4, byteorder="big") + image.size[1].to_bytes(4, byteorder="big")
+    else:
+        # Handle text/file embedding
+        flags |= FLAG_PAYLOAD_TEXT
+        if message:
+            plaintext = message.encode("utf-8")
+        else:
+            assert in_file is not None
+            with open(in_file, "rb") as f:
+                plaintext = f.read()
+    
+    # Encrypt (optional)
+    payload_bytes = plaintext
+    if password:
+        flags |= FLAG_ENCRYPTED
+        salt = os.urandom(DEFAULT_SALT_LEN)
+        nonce = os.urandom(DEFAULT_NONCE_LEN)
+        key = derive_key(password, salt)
+        aad = build_aad(flags, salt, nonce)
+        payload_bytes = AESGCM(key).encrypt(nonce, plaintext, aad)
+    
+    # Create header
+    header = StegoHeader(flags=flags, salt=salt, nonce=nonce, payload_len=len(payload_bytes)).to_bytes()
+    stego_data = header + payload_bytes + metadata
+    
+    # Load or create ID3 tag
+    try:
+        tags = ID3(mp3_path)
+    except:
+        tags = ID3()
+    
+    # Store embedded data in APIC (Attached Picture) frame as binary data
+    tags["APIC"] = APIC(
+        encoding=3,
+        mime="application/octet-stream",
+        type=0,
+        desc="STEG_DATA",
+        data=stego_data
+    )
+    
+    # Save to output file
+    shutil.copy(mp3_path, output_path)
+    tags.save(output_path, v2_version=3)
+    
+    payload_type = "image" if (flags & FLAG_PAYLOAD_IMAGE) else "text/file"
+    logging.info("Embedded %s in MP3: %s", payload_type, output_path)
+
+
+def extract_data_from_mp3(mp3_path: str, output_path: str, password: str | None = None) -> None:
+    """Extract text/file data or image from an MP3 file's ID3 tags with optional decryption."""
+    load_mp3(mp3_path)
+    
+    try:
+        tags = ID3(mp3_path)
+    except:
+        raise ValueError("No ID3 tags found in MP3 file")
+    
+    # Extract stego data from APIC frame
+    # The frame key includes the description: "APIC:STEG_DATA"
+    apic_frame = None
+    for key in tags.keys():
+        if key.startswith("APIC"):
+            apic_frame = tags[key]
+            break
+    
+    if apic_frame is None:
+        raise ValueError("No embedded data found in MP3 file")
+    
+    stego_data = apic_frame.data
+    
+    # Parse header
+    cursor = 0
+    
+    def read_bytes(num_bytes: int) -> bytes:
+        nonlocal cursor
+        data = stego_data[cursor:cursor + num_bytes]
+        cursor += num_bytes
+        return data
+    
+    header_prefix = read_bytes(12)
+    salt_len = header_prefix[6]
+    nonce_len = header_prefix[7]
+    
+    extra_header = b""
+    if salt_len + nonce_len > 0:
+        extra_header = read_bytes(salt_len + nonce_len)
+    
+    header = parse_header(header_prefix + extra_header)
+    
+    # Read payload
+    payload = read_bytes(header.payload_len)
+    
+    # Decrypt if needed
+    if header.flags & FLAG_ENCRYPTED:
+        if not password:
+            raise ValueError("Password required to decrypt embedded data")
+        key = derive_key(password, header.salt)
+        aad = build_aad(header.flags, header.salt, header.nonce)
+        plaintext = AESGCM(key).decrypt(header.nonce, payload, aad)
+    else:
+        plaintext = payload
+    
+    # Determine payload type and extract accordingly
+    if header.flags & FLAG_PAYLOAD_IMAGE:
+        # Extract image
+        img_width = int.from_bytes(read_bytes(4), byteorder="big")
+        img_height = int.from_bytes(read_bytes(4), byteorder="big")
+        
+        # Reconstruct image
+        pixels = []
+        for i in range(0, len(plaintext), 3):
+            if i + 3 <= len(plaintext):
+                pixels.append(tuple(plaintext[i:i+3]))
+        
+        image = Image.new("RGB", (img_width, img_height))
+        image.putdata(pixels)
+        image.save(output_path)
+        logging.info("Extracted image from MP3: %s", output_path)
+    else:
+        # Extract text/file
+        with open(output_path, "wb") as f:
+            f.write(plaintext)
+        logging.info("Extracted text/file from MP3: %s", output_path)
+
+
+# Legacy functions for backward compatibility
+def embed_image_in_mp3(mp3_path: str, image_path: str, output_path: str, password: str | None = None) -> None:
+    """Legacy function - use embed_data_in_mp3 instead."""
+    embed_data_in_mp3(mp3_path, output_path, password=password, image_path=image_path)
+
+
+def extract_image_from_mp3(mp3_path: str, output_path: str, password: str | None = None) -> None:
+    """Legacy function - use extract_data_from_mp3 instead."""
+    extract_data_from_mp3(mp3_path, output_path, password=password)
+
+
+def load_mp4(path: str) -> None:
+    """Load and validate MP4 file exists."""
+    try:
+        with open(path, "rb") as f:
+            pass
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MP4 file not found: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not open MP4 file '{path}': {exc}") from exc
+
+
+def embed_data_in_mp4(mp4_path: str, output_path: str, password: str | None = None,
+                      message: str | None = None, in_file: str | None = None,
+                      image_path: str | None = None, mp3_path: str | None = None) -> None:
+    """Embed text/file data, image, or MP3 into an MP4 file using metadata with optional encryption."""
+    import shutil
+    
+    load_mp4(mp4_path)
+    
+    # Determine payload type
+    payload_count = sum([message is not None, in_file is not None, image_path is not None, mp3_path is not None])
+    if payload_count == 0:
+        raise ValueError("Provide --message, --in-file, --image, or --mp3")
+    if payload_count > 1:
+        raise ValueError("Provide only one of: --message, --in-file, --image, or --mp3")
+    
+    flags = 0
+    salt = b""
+    nonce = b""
+    plaintext = b""
+    metadata = b""  # Additional metadata after payload
+    
+    if image_path:
+        # Handle image embedding
+        flags |= FLAG_PAYLOAD_IMAGE
+        image = load_image(image_path)
+        
+        # Convert image to bytes
+        image_bytes = bytearray()
+        for pixel in image.getdata():
+            image_bytes.extend(pixel)
+        plaintext = bytes(image_bytes)
+        
+        # Store image dimensions in metadata
+        metadata = image.size[0].to_bytes(4, byteorder="big") + image.size[1].to_bytes(4, byteorder="big")
+    elif mp3_path:
+        # Handle MP3 embedding
+        flags |= FLAG_PAYLOAD_MP3
+        load_mp3(mp3_path)
+        with open(mp3_path, "rb") as f:
+            plaintext = f.read()
+    else:
+        # Handle text/file embedding
+        flags |= FLAG_PAYLOAD_TEXT
+        if message:
+            plaintext = message.encode("utf-8")
+        else:
+            assert in_file is not None
+            with open(in_file, "rb") as f:
+                plaintext = f.read()
+    
+    # Encrypt (optional)
+    payload_bytes = plaintext
+    if password:
+        flags |= FLAG_ENCRYPTED
+        salt = os.urandom(DEFAULT_SALT_LEN)
+        nonce = os.urandom(DEFAULT_NONCE_LEN)
+        key = derive_key(password, salt)
+        aad = build_aad(flags, salt, nonce)
+        payload_bytes = AESGCM(key).encrypt(nonce, plaintext, aad)
+    
+    # Create header
+    header = StegoHeader(flags=flags, salt=salt, nonce=nonce, payload_len=len(payload_bytes)).to_bytes()
+    stego_data = header + payload_bytes + metadata
+    
+    # Load or create MP4 metadata
+    try:
+        tags = MP4(mp4_path)
+    except:
+        tags = MP4()
+    
+    # Store embedded data in custom metadata atom
+    # MP4 uses base64-encoded strings for data storage (mutagen limitation)
+    stego_b64 = base64.b64encode(stego_data).decode('ascii')
+    tags["©stg"] = [stego_b64]
+    
+    # Save to output file
+    shutil.copy(mp4_path, output_path)
+    tags.save(output_path)
+    
+    payload_type_map = {
+        FLAG_PAYLOAD_IMAGE: "image",
+        FLAG_PAYLOAD_TEXT: "text/file",
+        FLAG_PAYLOAD_MP3: "MP3 file"
+    }
+    payload_type = payload_type_map.get(flags & 0x38, "data")
+    logging.info("Embedded %s in MP4: %s", payload_type, output_path)
+
+
+def extract_data_from_mp4(mp4_path: str, output_path: str, password: str | None = None) -> None:
+    """Extract text/file data, image, or MP3 from an MP4 file with optional decryption."""
+    load_mp4(mp4_path)
+    
+    try:
+        tags = MP4(mp4_path)
+    except:
+        raise ValueError("Could not read MP4 metadata")
+    
+    # Extract stego data from custom metadata atom
+    if "©stg" not in tags:
+        raise ValueError("No embedded data found in MP4 file")
+    
+    # Decode from base64 (mutagen stores as string)
+    stego_b64 = tags["©stg"][0]
+    stego_data = base64.b64decode(stego_b64)
+    
+    # Parse header
+    cursor = 0
+    
+    def read_bytes(num_bytes: int) -> bytes:
+        nonlocal cursor
+        data = stego_data[cursor:cursor + num_bytes]
+        cursor += num_bytes
+        return data
+    
+    header_prefix = read_bytes(12)
+    salt_len = header_prefix[6]
+    nonce_len = header_prefix[7]
+    
+    extra_header = b""
+    if salt_len + nonce_len > 0:
+        extra_header = read_bytes(salt_len + nonce_len)
+    
+    header = parse_header(header_prefix + extra_header)
+    
+    # Read payload
+    payload = read_bytes(header.payload_len)
+    
+    # Decrypt if needed
+    if header.flags & FLAG_ENCRYPTED:
+        if not password:
+            raise ValueError("Password required to decrypt embedded data")
+        key = derive_key(password, header.salt)
+        aad = build_aad(header.flags, header.salt, header.nonce)
+        plaintext = AESGCM(key).decrypt(header.nonce, payload, aad)
+    else:
+        plaintext = payload
+    
+    # Determine payload type and extract accordingly
+    if header.flags & FLAG_PAYLOAD_IMAGE:
+        # Extract image
+        img_width = int.from_bytes(read_bytes(4), byteorder="big")
+        img_height = int.from_bytes(read_bytes(4), byteorder="big")
+        
+        # Reconstruct image
+        pixels = []
+        for i in range(0, len(plaintext), 3):
+            if i + 3 <= len(plaintext):
+                pixels.append(tuple(plaintext[i:i+3]))
+        
+        image = Image.new("RGB", (img_width, img_height))
+        image.putdata(pixels)
+        image.save(output_path)
+        logging.info("Extracted image from MP4: %s", output_path)
+    elif header.flags & FLAG_PAYLOAD_MP3:
+        # Extract MP3
+        with open(output_path, "wb") as f:
+            f.write(plaintext)
+        logging.info("Extracted MP3 from MP4: %s", output_path)
+    else:
+        # Extract text/file
+        with open(output_path, "wb") as f:
+            f.write(plaintext)
+        logging.info("Extracted text/file from MP4: %s", output_path)
+
+
 def read_payload(message: str | None, infile: str | None) -> bytes:
     if message and infile:
         raise ValueError("Provide either --message or --in-file, not both")
@@ -342,8 +704,43 @@ def decode_image(args: argparse.Namespace) -> None:
         print(decoded_text)
 
 
+def encode_mp3(args: argparse.Namespace) -> None:
+    """Encode text/file data or image into an MP3 file."""
+    embed_data_in_mp3(
+        args.mp3,
+        args.out,
+        password=args.password,
+        message=getattr(args, 'message', None),
+        in_file=getattr(args, 'in_file', None),
+        image_path=getattr(args, 'image', None)
+    )
+
+
+def decode_mp3(args: argparse.Namespace) -> None:
+    """Decode text/file data or image from an MP3 file."""
+    extract_data_from_mp3(args.mp3, args.out, password=args.password)
+
+
+def encode_mp4(args: argparse.Namespace) -> None:
+    """Encode text/file data, image, or MP3 into an MP4 file."""
+    embed_data_in_mp4(
+        args.mp4,
+        args.out,
+        password=args.password,
+        message=getattr(args, 'message', None),
+        in_file=getattr(args, 'in_file', None),
+        image_path=getattr(args, 'image', None),
+        mp3_path=getattr(args, 'mp3', None)
+    )
+
+
+def decode_mp4(args: argparse.Namespace) -> None:
+    """Decode text/file data, image, or MP3 from an MP4 file."""
+    extract_data_from_mp4(args.mp4, args.out, password=args.password)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LSB image steganography")
+    parser = argparse.ArgumentParser(description="LSB image steganography, MP3/MP4 audio/video embedding")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -381,6 +778,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="PRNG key string if embedding used PRNG",
     )
     dec.set_defaults(func=decode_image)
+
+    # MP3 encoding subcommand
+    mp3_enc = subparsers.add_parser("mp3-encode", help="Embed text/file data or image into an MP3 file")
+    mp3_enc.add_argument("--mp3", required=True, help="Input MP3 file path")
+    mp3_enc.add_argument("--out", required=True, help="Output MP3 file path")
+    mp3_enc.add_argument("--image", help="Image file to embed")
+    mp3_enc.add_argument("--message", help="Plaintext message to embed")
+    mp3_enc.add_argument("--in-file", help="File whose contents to embed")
+    mp3_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    mp3_enc.set_defaults(func=encode_mp3)
+
+    # MP3 decoding subcommand
+    mp3_dec = subparsers.add_parser("mp3-decode", help="Extract text/file data or image from an MP3 file")
+    mp3_dec.add_argument("--mp3", required=True, help="MP3 file with embedded data")
+    mp3_dec.add_argument("--out", required=True, help="Output file path (image or text/file)")
+    mp3_dec.add_argument("--password", help="Password if data is encrypted")
+    mp3_dec.set_defaults(func=decode_mp3)
+
+    # MP4 encoding subcommand
+    mp4_enc = subparsers.add_parser("mp4-encode", help="Embed text/file data, image, or MP3 into an MP4 file")
+    mp4_enc.add_argument("--mp4", required=True, help="Input MP4 file path")
+    mp4_enc.add_argument("--out", required=True, help="Output MP4 file path")
+    mp4_enc.add_argument("--image", help="Image file to embed")
+    mp4_enc.add_argument("--message", help="Plaintext message to embed")
+    mp4_enc.add_argument("--in-file", help="File whose contents to embed")
+    mp4_enc.add_argument("--mp3", help="MP3 file to embed")
+    mp4_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    mp4_enc.set_defaults(func=encode_mp4)
+
+    # MP4 decoding subcommand
+    mp4_dec = subparsers.add_parser("mp4-decode", help="Extract text/file data, image, or MP3 from an MP4 file")
+    mp4_dec.add_argument("--mp4", required=True, help="MP4 file with embedded data")
+    mp4_dec.add_argument("--out", required=True, help="Output file path (image, text/file, or MP3)")
+    mp4_dec.add_argument("--password", help="Password if data is encrypted")
+    mp4_dec.set_defaults(func=decode_mp4)
 
     return parser
 

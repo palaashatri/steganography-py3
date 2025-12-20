@@ -18,10 +18,10 @@ pip install -r requirements.txt >/dev/null
 # If arguments are provided, pass them through to the CLI.
 # Otherwise, run a simple encode demo.
 if [[ $# -gt 0 ]]; then
-  python3 1_Implementation/app.py "$@"
+  python3 ./app.py "$@"
 else
-  python3 1_Implementation/app.py encode \
-    --image "1_Implementation/test.jpg" \
+  python3 ./app.py encode \
+    --image "./test.jpg" \
     --out "secret.png" \
     --message "Hello, World"
 fi

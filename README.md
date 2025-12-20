@@ -1,6 +1,10 @@
-# Python 3 Image Steganography
+# Python 3 Steganography Suite
 
-CLI tool for LSB image steganography with optional AES-256-GCM protection, fixed headers, and capacity checks.
+Complete CLI tool for steganography with multiple embedding methods:
+- **LSB Image Steganography**: Hide text/files in images using Least Significant Bit techniques
+- **MP3 Audio Steganography**: Hide text/files/images in MP3 files using ID3 tags
+
+All methods support optional AES-256-GCM encryption with password protection.
 
 ## Folder Structure
 | Folder | Description |
@@ -15,39 +19,178 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Methods
-- **lsb:** Basic sequential LSB substitution.
-- **lsb-prng:** Pixels selected via PRNG permutation using `--prng-key`.
-- **lsb-match-prng:** LSB matching (±1) with PRNG permutation.
+## Features
 
-Use lossless formats (PNG) for outputs; JPEG recompression will destroy hidden data.
+### Image Steganography (LSB)
+- **lsb:** Basic sequential LSB substitution
+- **lsb-prng:** Pixels selected via PRNG permutation using `--prng-key`
+- **lsb-match-prng:** LSB matching (±1) with PRNG permutation
+- Optional AES-256-GCM encryption
+
+### MP3 Steganography (ID3 Tags)
+- Embed text messages, files, or images in MP3 files
+- Automatic payload type detection on extraction
+- Optional AES-256-GCM encryption
+- Preserves audio quality and playback
+
+**Note:** Use lossless image formats (PNG) for outputs; JPEG recompression will destroy hidden data.
 
 ## Usage
 
-Encode a message into an image (basic LSB):
+### Graphical User Interface (GUI)
+
+Launch the GUI application with a user-friendly interface:
 ```bash
-python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb
+python3 1_Implementation/gui.py
 ```
 
-Encode with PRNG permutation:
+The GUI provides:
+- **Tabbed Interface**: Separate tabs for Image, MP3, and MP4 encode/decode operations
+- **File Browsing**: Easy file selection with native file dialogs
+- **Visual Feedback**: Status bar showing operation progress and results
+- **Data Extraction Display**: Built-in text viewer for extracted content
+- **Password Protection**: Simple password entry for encrypted operations
+
+**Features:**
+- Image steganography (LSB) with text/file/image embedding
+- MP3 audio steganography with auto-detection of payload types
+- MP4 video steganography with comprehensive data embedding
+- Optional encryption/decryption with passwords
+- Real-time status updates and error messages
+- Clear and intuitive workflow for each media type
+
+### Image Steganography
+
+**Encode text into image (basic LSB):**
 ```bash
-python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-prng --prng-key "my-key"
+python3 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world"
 ```
 
-Encode with LSB matching + PRNG:
+**Encode with PRNG permutation:**
 ```bash
-python 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-match-prng --prng-key "my-key"
+python3 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-prng --prng-key "my-key"
 ```
 
-Optional encryption:
+**Encode with LSB matching + PRNG:**
 ```bash
-python 1_Implementation/app.py encode --image cover.png --out secret.png --in-file notes.txt --password "strong passphrase"
+python3 1_Implementation/app.py encode --image cover.png --out secret.png --message "hello world" --method lsb-match-prng --prng-key "my-key"
 ```
 
-Decode to stdout (basic LSB):
+**Encode file with encryption:**
 ```bash
-python 1_Implementation/app.py decode --image secret.png --method lsb
+python3 1_Implementation/app.py encode --image cover.png --out secret.png --in-file notes.txt --password "strong passphrase"
 ```
+
+**Decode from image:**
+```bash
+python3 1_Implementation/app.py decode --image secret.png --method lsb
+```
+
+**Decode encrypted image to file:**
+```bash
+python3 1_Implementation/app.py decode --image secret.png --out extracted.txt --password "strong passphrase"
+```
+
+### MP3 Steganography
+
+**Embed text message in MP3:**
+```bash
+python3 1_Implementation/app.py mp3-encode --mp3 song.mp3 --out output.mp3 --message "Secret message"
+```
+
+**Embed text with encryption:**
+```bash
+python3 1_Implementation/app.py mp3-encode --mp3 song.mp3 --out output.mp3 --message "Secret message" --password "secure_key"
+```
+
+**Embed file in MP3:**
+```bash
+python3 1_Implementation/app.py mp3-encode --mp3 song.mp3 --out output.mp3 --in-file secret.zip
+```
+
+**Embed image in MP3:**
+```bash
+python3 1_Implementation/app.py mp3-encode --mp3 song.mp3 --out output.mp3 --image secret.png
+```
+
+**Extract from MP3 (auto-detects type):**
+```bash
+python3 1_Implementation/app.py mp3-decode --mp3 output.mp3 --out extracted_data
+```
+
+**Extract encrypted MP3:**
+```bash
+python3 1_Implementation/app.py mp3-decode --mp3 output.mp3 --out extracted_data --password "secure_key"
+```
+
+### MP4 Steganography
+
+**Embed text message in MP4:**
+```bash
+python3 1_Implementation/app.py mp4-encode --mp4 video.mp4 --out output.mp4 --message "Secret message"
+```
+
+**Embed text with encryption:**
+```bash
+python3 1_Implementation/app.py mp4-encode --mp4 video.mp4 --out output.mp4 --message "Secret message" --password "secure_key"
+```
+
+**Embed image in MP4:**
+```bash
+python3 1_Implementation/app.py mp4-encode --mp4 video.mp4 --out output.mp4 --image secret.png
+```
+
+**Embed MP3 in MP4:**
+```bash
+python3 1_Implementation/app.py mp4-encode --mp4 video.mp4 --out output.mp4 --mp3 audio.mp3
+```
+
+**Extract from MP4 (auto-detects type):**
+```bash
+python3 1_Implementation/app.py mp4-decode --mp4 output.mp4 --out extracted_data
+```
+
+**Extract encrypted MP4:**
+```bash
+python3 1_Implementation/app.py mp4-decode --mp4 output.mp4 --out extracted_data --password "secure_key"
+```
+
+## Complete Example Workflow
+
+```bash
+# 1. Hide text in image using LSB
+python3 1_Implementation/app.py encode --image cover.png --out image_with_text.png --message "Secret message"
+
+# 2. Hide the image file in MP3
+python3 1_Implementation/app.py mp3-encode --mp3 song.mp3 --out song_with_image.mp3 --image image_with_text.png
+
+# 3. Extract image from MP3
+python3 1_Implementation/app.py mp3-decode --mp3 song_with_image.mp3 --out recovered_image.png
+
+# 4. Extract text from recovered image
+python3 1_Implementation/app.py decode --image recovered_image.png --out final_message.txt
+```
+
+## Testing
+
+Run the comprehensive test suite:
+```bash
+python3 test_suite.py
+```
+
+This validates all functionality including:
+- LSB image steganography
+- LSB with encryption
+- MP3 text embedding
+- MP3 image embedding
+- MP3 file embedding
+- MP3 encrypted embedding
+- MP4 text embedding
+- MP4 image embedding
+- MP4 MP3 embedding
+- MP4 encrypted embedding
+
+**Expected Result:** 10/10 tests passed
 
 Decode (PRNG-based):
 ```bash
