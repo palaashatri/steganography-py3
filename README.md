@@ -1,16 +1,14 @@
 # Python 3 Steganography Suite
 
+<img width="1842" height="1376" alt="image" src="https://github.com/user-attachments/assets/483c80c4-fa38-4839-b4d1-ebf94ff58659" />
+
+
 Complete CLI tool for steganography with multiple embedding methods:
 - **LSB Image Steganography**: Hide text/files in images using Least Significant Bit techniques
 - **MP3 Audio Steganography**: Hide text/files/images in MP3 files using ID3 tags
 
 All methods support optional AES-256-GCM encryption with password protection.
 
-## Folder Structure
-| Folder | Description |
-|---|---|
-| 1_Implementation | All code |
-| 2_ImagesAndVideos | Screenshots and demo video |
 
 ## Setup
 ```bash
