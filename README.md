@@ -1,4 +1,4 @@
-# Python 3 Steganography Suite
+# Steganography Suite built with Python 3 PyTk
 
 <img width="1842" height="1376" alt="image" src="https://github.com/user-attachments/assets/483c80c4-fa38-4839-b4d1-ebf94ff58659" />
 
