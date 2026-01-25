@@ -97,7 +97,6 @@ jobs:
     name: Build Executable - ${{ matrix.os }}
     needs: test
     runs-on: ${{ matrix.os }}
-    if: github.event_name == 'release'
     strategy:
       matrix:
         include:
