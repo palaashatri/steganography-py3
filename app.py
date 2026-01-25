@@ -1777,7 +1777,7 @@ def gui_main() -> None:
     import json
     import base64
     from typing import Optional, Callable
-    from PIL import Image, ImageChops, ImageStat, ImageDraw, ImageTk
+    from PIL import Image, ImageChops, ImageStat, ImageDraw, ImageTk, ImageFont
 
     try:
         from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -1786,6 +1786,68 @@ def gui_main() -> None:
         dnd_available = False
         DND_FILES = None
         TkinterDnD = None
+
+    # Spacing constants - 4px grid system
+    PADDING_SMALL = 8
+    PADDING_MEDIUM = 12
+    PADDING_LARGE = 16
+    PADDING_XL = 20
+    PADDING_XXL = 24
+    BUTTON_WIDTH = 12
+    BUTTON_WIDTH_LARGE = 16
+
+    class PlaceholderEntry(ttk.Entry):
+        """Entry widget with placeholder text support."""
+        def __init__(self, parent, placeholder="", **kwargs):
+            super().__init__(parent, **kwargs)
+            self.placeholder = placeholder
+            self.placeholder_color = "#999999"
+            self.default_color = "SystemWindowText"
+            self._has_placeholder = False
+            
+            if placeholder:
+                self._show_placeholder()
+            
+            self.bind("<FocusIn>", self._on_focus_in)
+            self.bind("<FocusOut>", self._on_focus_out)
+        
+        def _show_placeholder(self, *args):
+            if not self.get():
+                self._has_placeholder = True
+                self.insert(0, self.placeholder)
+                self.config(foreground=self.placeholder_color)
+        
+        def _on_focus_in(self, *args):
+            if self._has_placeholder:
+                self.delete(0, tk.END)
+                self.config(foreground=self.default_color)
+                self._has_placeholder = False
+        
+        def _on_focus_out(self, *args):
+            if not self.get():
+                self._show_placeholder()
+        
+        def get_value(self):
+            """Get actual value without placeholder."""
+            return "" if self._has_placeholder else self.get()
+
+    class PasswordEntry(ttk.Frame):
+        """Password entry with show/hide toggle."""
+        def __init__(self, parent, textvariable=None, **kwargs):
+            super().__init__(parent)
+            self.var = textvariable or tk.StringVar()
+            self.showing = False
+            
+            self.entry = ttk.Entry(self, textvariable=self.var, show="●", **kwargs)
+            self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            self.toggle_btn = ttk.Button(self, text="👁", width=3, command=self._toggle_visibility)
+            self.toggle_btn.pack(side=tk.LEFT, padx=(4, 0))
+        
+        def _toggle_visibility(self):
+            self.showing = not self.showing
+            self.entry.config(show="" if self.showing else "●")
+            self.toggle_btn.config(text="👁" if not self.showing else "✕")
 
     class CapacityCalculator:
         @staticmethod
@@ -1866,7 +1928,10 @@ def gui_main() -> None:
             self.tip = tip = tk.Toplevel(self.widget)
             tip.wm_overrideredirect(True)
             tip.wm_geometry(f"+{x}+{y}")
-            label = ttk.Label(tip, text=self.text, padding=(8, 4))
+            # Tooltips always use a light background for readability
+            tip.configure(bg="#f0f0f0")
+            label = tk.Label(tip, text=self.text, bg="#f0f0f0", fg="#000000", 
+                           padx=8, pady=4, relief=tk.SOLID, borderwidth=1)
             label.pack()
 
         def hide(self, _event=None):
@@ -1883,32 +1948,83 @@ def gui_main() -> None:
 
     class StatusBar(ttk.Frame):
         def __init__(self, parent: tk.Widget):
-            super().__init__(parent)
-            self.message = ttk.Label(self, text="Ready")
-            self.message.pack(side=tk.LEFT, padx=(8, 12))
+            super().__init__(parent, relief=tk.RAISED, borderwidth=1)
+            self.message = ttk.Label(self, text="Ready", font=("TkDefaultFont", 9))
+            self.message.pack(side=tk.LEFT, padx=(PADDING_MEDIUM, PADDING_MEDIUM))
+            
+            ttk.Separator(self, orient=tk.VERTICAL).pack(side=tk.RIGHT, fill=tk.Y, padx=4)
+            
+            self.time_label = ttk.Label(self, text="", font=("TkDefaultFont", 9))
+            self.time_label.pack(side=tk.RIGHT, padx=(0, PADDING_SMALL))
+            
             self.progress = ttk.Progressbar(self, mode="indeterminate", length=200)
-            self.progress.pack(side=tk.RIGHT, padx=8, pady=2)
+            self.progress.pack(side=tk.RIGHT, padx=PADDING_SMALL, pady=2)
+            
+            self.start_time = None
 
-        def set_status(self, text: str) -> None:
-            self.message.config(text=text)
+        def set_status(self, text: str, status_type: str = "info") -> None:
+            """Set status with optional type (info/success/error/warning)."""
+            prefix = ""
+            if status_type == "success":
+                prefix = "✓ "
+            elif status_type == "error":
+                prefix = "✗ "
+            elif status_type == "warning":
+                prefix = "⚠ "
+            self.message.config(text=prefix + text)
 
         def start(self) -> None:
             self.progress.start(10)
+            self.start_time = time.time()
+            self._update_elapsed()
 
         def stop(self) -> None:
             self.progress.stop()
+            self.start_time = None
+            self.time_label.config(text="")
+        
+        def _update_elapsed(self):
+            if self.start_time:
+                elapsed = int(time.time() - self.start_time)
+                mins, secs = divmod(elapsed, 60)
+                self.time_label.config(text=f"{mins:02d}:{secs:02d}")
+                self.after(1000, self._update_elapsed)
 
     class SteganographyGUI:
         def __init__(self, root: tk.Tk):
             self.root = root
             self.root.title("Steganography Suite")
-            self.root.geometry("1300x900")
-            self.root.minsize(1000, 700)
+            
+            # Enable DPI awareness on Windows
+            if sys.platform == "win32":
+                try:
+                    from ctypes import windll
+                    windll.shcore.SetProcessDpiAwareness(1)
+                except Exception:
+                    pass
+            
+            self.root.geometry("1400x920")
+            self.root.minsize(1100, 750)
             self.history: list[HistoryItem] = []
             self.dark_mode = tk.BooleanVar(value=self._detect_dark_mode())
+            self.preview_visible = tk.BooleanVar(value=True)
+            self.recent_files: list[str] = []
+            self.preferences = self._load_preferences()
+            
+            # Restore window geometry
+            if "geometry" in self.preferences:
+                try:
+                    self.root.geometry(self.preferences["geometry"])
+                except Exception:
+                    pass
+            
             self._apply_native_theme()
             self._build_ui()
             self._apply_theme(self.dark_mode.get())
+            self._setup_keyboard_shortcuts()
+            
+            # Save window geometry on close
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         def _apply_native_theme(self) -> None:
             style = ttk.Style()
@@ -1932,20 +2048,49 @@ def gui_main() -> None:
                     pass
                 self._apply_native_theme()
                 self.root.configure(bg="SystemButtonFace")
+                
+                # Reset to light theme defaults
+                style.configure("Primary.TButton", padding=(PADDING_MEDIUM, PADDING_SMALL))
+                style.configure("TLabelframe.Label", font=("TkDefaultFont", 10, "bold"))
+                style.configure("Header.TLabel", font=("TkDefaultFont", 16, "bold"))
+                
+                # Reset all widget backgrounds to defaults
+                style.configure("TFrame", background="SystemButtonFace")
+                style.configure("TLabel", background="SystemButtonFace")
+                style.configure("TLabelframe", background="SystemButtonFace", bordercolor="SystemButtonShadow")
+                style.configure("TButton", relief=tk.RAISED)
+                style.configure("TNotebook", background="SystemButtonFace")
+                style.configure("TNotebook.Tab", padding=(PADDING_MEDIUM, PADDING_SMALL))
+                style.map("TNotebook.Tab", 
+                         background=[("selected", "SystemButtonFace"), ("!selected", "SystemButtonShadow")],
+                         padding=[("selected", (PADDING_MEDIUM, PADDING_SMALL)), ("!selected", (PADDING_MEDIUM, PADDING_SMALL))])
+                style.configure("TCheckbutton", background="SystemButtonFace")
+                style.configure("TRadiobutton", background="SystemButtonFace")
+                
+                # Clear Listbox dark mode options
+                self.root.option_add("*Listbox.background", "SystemWindow")
+                self.root.option_add("*Listbox.foreground", "SystemWindowText")
+                self.root.option_add("*Listbox.selectBackground", "SystemHighlight")
+                self.root.option_add("*Listbox.selectForeground", "SystemHighlightText")
+                
                 return
 
             if "clam" in style.theme_names():
                 style.theme_use("clam")
 
-            bg = "#1e1f22"
-            panel = "#2b2d31"
-            surface = "#313338"
-            fg = "#e6e6e6"
-            muted = "#b4b4b4"
-            accent = "#3b82f6"
+            # More unified dark theme colors
+            bg = "#2b2d31"           # Main background
+            panel = "#1e1f22"        # Slightly darker for depth
+            surface = "#313338"      # Subtle variation for controls
+            fg = "#dcddde"           # Softer white
+            muted = "#96989d"        # Muted text
+            accent = "#5865f2"       # Discord-like blue
+            success = "#3ba55d"
+            error = "#ed4245"
+            warning = "#faa81a"
 
             self.root.configure(bg=bg)
-            self.root.option_add("*Listbox.background", panel)
+            self.root.option_add("*Listbox.background", bg)
             self.root.option_add("*Listbox.foreground", fg)
             self.root.option_add("*Listbox.selectBackground", accent)
             self.root.option_add("*Listbox.selectForeground", "#ffffff")
@@ -1953,27 +2098,31 @@ def gui_main() -> None:
 
             style.configure("TFrame", background=bg)
             style.configure("TLabel", background=bg, foreground=fg)
-            style.configure("TLabelframe", background=bg, foreground=fg, bordercolor=surface)
-            style.configure("TLabelframe.Label", background=bg, foreground=fg)
-            style.configure("TButton", background=surface, foreground=fg)
-            style.map("TButton", background=[("active", panel)])
-            style.configure("TEntry", fieldbackground=panel, foreground=fg, insertcolor=fg)
-            style.configure("TCombobox", fieldbackground=panel, foreground=fg)
+            style.configure("TLabelframe", background=bg, foreground=fg, bordercolor=panel, relief=tk.FLAT)
+            style.configure("TLabelframe.Label", background=bg, foreground=fg, font=("TkDefaultFont", 10, "bold"))
+            style.configure("Header.TLabel", background=bg, foreground=fg, font=("TkDefaultFont", 16, "bold"))
+            style.configure("TButton", background=surface, foreground=fg, padding=(PADDING_SMALL, 4), borderwidth=1, relief=tk.FLAT)
+            style.configure("Primary.TButton", background=accent, foreground="#ffffff", padding=(PADDING_MEDIUM, PADDING_SMALL), borderwidth=0, relief=tk.FLAT)
+            style.map("TButton", background=[("active", panel), ("pressed", panel)])
+            style.map("Primary.TButton", background=[("active", "#4752c4"), ("pressed", "#3c45a5")])
+            style.configure("TEntry", fieldbackground=panel, foreground=fg, insertcolor=fg, padding=6, borderwidth=1, relief=tk.FLAT)
+            style.configure("TCombobox", fieldbackground=panel, foreground=fg, padding=6, borderwidth=1, relief=tk.FLAT, arrowcolor=fg)
             style.map("TCombobox", fieldbackground=[("readonly", panel)], foreground=[("readonly", fg)])
-            style.configure("TCheckbutton", background=bg, foreground=fg)
-            style.configure("TRadiobutton", background=bg, foreground=fg)
-            style.configure("TNotebook", background=bg, borderwidth=0)
-            style.configure("TNotebook.Tab", background=surface, foreground=fg, padding=(12, 6))
+            style.configure("TCheckbutton", background=bg, foreground=fg, padding=4, borderwidth=0)
+            style.configure("TRadiobutton", background=bg, foreground=fg, padding=4, borderwidth=0)
+            style.configure("TNotebook", background=bg, borderwidth=0, padding=0)
+            style.configure("TNotebook.Tab", background=panel, foreground=muted, padding=(PADDING_MEDIUM, PADDING_SMALL), borderwidth=0)
             style.map(
                 "TNotebook.Tab",
-                background=[("selected", panel)],
-                foreground=[("selected", fg)],
-                padding=[("selected", (12, 6)), ("!selected", (12, 6))],
+                background=[("selected", bg), ("!selected", panel)],
+                foreground=[("selected", fg), ("!selected", muted)],
+                padding=[("selected", (PADDING_MEDIUM, PADDING_SMALL)), ("!selected", (PADDING_MEDIUM, PADDING_SMALL))],
             )
-            style.configure("Treeview", background=panel, fieldbackground=panel, foreground=fg)
-            style.configure("Treeview.Heading", background=surface, foreground=fg)
+            style.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=28, borderwidth=0)
+            style.configure("Treeview.Heading", background=panel, foreground=fg, padding=8, borderwidth=0, relief=tk.FLAT)
             style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "#ffffff")])
-            style.configure("TProgressbar", background=accent, troughcolor=surface)
+            style.configure("TProgressbar", background=accent, troughcolor=panel, thickness=6, borderwidth=0)
+            style.configure("TSeparator", background=panel)
 
         def _detect_dark_mode(self) -> bool:
             try:
@@ -1996,90 +2145,362 @@ def gui_main() -> None:
             return False
 
         def _build_ui(self) -> None:
+            # Header with title and toolbar
             header = ttk.Frame(self.root)
-            header.pack(side=tk.TOP, fill=tk.X, padx=12, pady=8)
-            ttk.Label(header, text="Steganography Suite", font=("TkDefaultFont", 16, "bold")).pack(side=tk.TOP)
+            header.pack(side=tk.TOP, fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+            
+            title_frame = ttk.Frame(header)
+            title_frame.pack(side=tk.TOP, fill=tk.X, pady=(PADDING_SMALL, 0))
+            ttk.Label(title_frame, text="Steganography Suite", style="Header.TLabel").pack(side=tk.LEFT)
+            
+            # Quick action toolbar
+            toolbar = ttk.Frame(title_frame)
+            toolbar.pack(side=tk.RIGHT)
+            ttk.Button(toolbar, text="Open", width=8, command=self._quick_open).pack(side=tk.LEFT, padx=2)
+            ttk.Button(toolbar, text="Settings", width=8, command=self._show_settings).pack(side=tk.LEFT, padx=2)
+            ttk.Checkbutton(toolbar, text="Preview", variable=self.preview_visible, 
+                          command=self._toggle_preview).pack(side=tk.LEFT, padx=PADDING_SMALL)
+            
+            ttk.Separator(header, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(PADDING_SMALL, 0))
+            
+            # Recent files bar
+            self.recent_bar = ttk.Frame(header)
+            self.recent_bar.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+            self._update_recent_files_ui()
 
+            # Main content area
             content = ttk.Frame(self.root)
-            content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-            content.columnconfigure(0, minsize=320)
-            content.columnconfigure(1, weight=1)
-            content.columnconfigure(2, minsize=320)
+            content.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            content.columnconfigure(0, weight=1)
+            content.columnconfigure(1, minsize=340)
             content.rowconfigure(0, weight=1)
 
-            ttk.Frame(content, width=320).grid(row=0, column=0, sticky="ns")
-
             main_center = ttk.Frame(content)
-            main_center.grid(row=0, column=1, sticky="nsew")
+            main_center.grid(row=0, column=0, sticky="nsew", padx=(0, PADDING_SMALL))
             main_center.rowconfigure(0, weight=1)
             main_center.columnconfigure(0, weight=1)
 
             self.notebook = ttk.Notebook(main_center)
-            self.notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+            self.notebook.grid(row=0, column=0, sticky="nsew")
 
-            self.preview_frame = ttk.Labelframe(content, text="Preview")
-            self.preview_frame.grid(row=0, column=2, sticky="ns", padx=(8, 0), pady=4)
+            # Preview panel (collapsible)
+            self.preview_frame = ttk.Labelframe(content, text="Preview & Info")
+            self.preview_frame.grid(row=0, column=1, sticky="nsew", pady=0)
             self.preview_frame.columnconfigure(0, weight=1)
+            self.preview_frame.rowconfigure(0, weight=1)
 
             self._preview_image_ref = None
             self._preview_video_ref = None
 
-            image_box = ttk.Labelframe(self.preview_frame, text="Image")
-            image_box.pack(fill=tk.X, padx=8, pady=(8, 4))
-            self.preview_image = ttk.Label(image_box, text="No image selected")
-            self.preview_image.pack(fill=tk.X, padx=6, pady=6)
+            preview_scroll = ttk.Frame(self.preview_frame)
+            preview_scroll.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
 
-            audio_box = ttk.Labelframe(self.preview_frame, text="Audio")
-            audio_box.pack(fill=tk.X, padx=8, pady=4)
-            self.preview_audio = ttk.Label(audio_box, text="No audio selected", wraplength=260, justify=tk.LEFT)
-            self.preview_audio.pack(fill=tk.X, padx=6, pady=6)
+            image_box = ttk.Labelframe(preview_scroll, text="Image")
+            image_box.pack(fill=tk.X, pady=(0, PADDING_SMALL))
+            self.preview_image = ttk.Label(image_box, text="No image selected", anchor=tk.CENTER)
+            self.preview_image.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            
+            # File info display
+            self.file_info_label = ttk.Label(image_box, text="", font=("TkDefaultFont", 8), foreground="#666")
+            self.file_info_label.pack(fill=tk.X, padx=PADDING_SMALL, pady=(0, PADDING_SMALL))
 
-            video_box = ttk.Labelframe(self.preview_frame, text="Video")
-            video_box.pack(fill=tk.X, padx=8, pady=4)
-            self.preview_video = ttk.Label(video_box, text="No video selected")
-            self.preview_video.pack(fill=tk.X, padx=6, pady=6)
+            audio_box = ttk.Labelframe(preview_scroll, text="Audio")
+            audio_box.pack(fill=tk.X, pady=(0, PADDING_SMALL))
+            self.preview_audio = ttk.Label(audio_box, text="No audio selected", wraplength=300, justify=tk.LEFT)
+            self.preview_audio.pack(fill=tk.X, padx=PADDING_SMALL, pady=PADDING_SMALL)
 
-            pdf_box = ttk.Labelframe(self.preview_frame, text="PDF")
-            pdf_box.pack(fill=tk.X, padx=8, pady=(4, 8))
-            self.preview_pdf = ttk.Label(pdf_box, text="No PDF selected", wraplength=260, justify=tk.LEFT)
-            self.preview_pdf.pack(fill=tk.X, padx=6, pady=6)
+            video_box = ttk.Labelframe(preview_scroll, text="Video")
+            video_box.pack(fill=tk.X, pady=(0, PADDING_SMALL))
+            self.preview_video = ttk.Label(video_box, text="No video selected", anchor=tk.CENTER)
+            self.preview_video.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
 
+            pdf_box = ttk.Labelframe(preview_scroll, text="PDF")
+            pdf_box.pack(fill=tk.X, pady=(0, PADDING_SMALL))
+            self.preview_pdf = ttk.Label(pdf_box, text="No PDF selected", wraplength=300, justify=tk.LEFT)
+            self.preview_pdf.pack(fill=tk.X, padx=PADDING_SMALL, pady=PADDING_SMALL)
+
+            # Reorganized tabs by workflow
             self.tabs = {
-                "Image": ttk.Frame(self.notebook),
-                "Audio": ttk.Frame(self.notebook),
-                "Video": ttk.Frame(self.notebook),
-                "Video Frames": ttk.Frame(self.notebook),
-                "GIF": ttk.Frame(self.notebook),
-                "PDF": ttk.Frame(self.notebook),
-                "Tools": ttk.Frame(self.notebook),
-                "Batch": ttk.Frame(self.notebook),
-                "Analyze": ttk.Frame(self.notebook),
+                "Hide Data": ttk.Frame(self.notebook),
+                "Reveal Data": ttk.Frame(self.notebook),
+                "Advanced": ttk.Frame(self.notebook),
+                "Batch Operations": ttk.Frame(self.notebook),
+                "Analysis & Tools": ttk.Frame(self.notebook),
                 "History": ttk.Frame(self.notebook),
             }
 
             for name, frame in self.tabs.items():
                 self.notebook.add(frame, text=name)
 
-            self._build_image_tab(self.tabs["Image"])
-            self._build_audio_tab(self.tabs["Audio"])
-            self._build_video_tab(self.tabs["Video"])
-            self._build_video_frames_tab(self.tabs["Video Frames"])
-            self._build_gif_tab(self.tabs["GIF"])
-            self._build_pdf_tab(self.tabs["PDF"])
-            self._build_tools_tab(self.tabs["Tools"])
-            self._build_batch_tab(self.tabs["Batch"])
-            self._build_analyze_tab(self.tabs["Analyze"])
+            # Build main tabs with sub-notebooks
+            self._build_hide_data_tab(self.tabs["Hide Data"])
+            self._build_reveal_data_tab(self.tabs["Reveal Data"])
+            self._build_advanced_tab(self.tabs["Advanced"])
+            self._build_batch_tab(self.tabs["Batch Operations"])
+            self._build_tools_tab(self.tabs["Analysis & Tools"])
             self._build_history_tab(self.tabs["History"])
 
             self.status = StatusBar(self.root)
             self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
+        def _setup_keyboard_shortcuts(self) -> None:
+            """Setup keyboard shortcuts for common actions."""
+            self.root.bind("<Control-o>", lambda e: self._quick_open())
+            self.root.bind("<Control-s>", lambda e: self._quick_save())
+            self.root.bind("<Control-comma>", lambda e: self._show_settings())
+            self.root.bind("<F1>", lambda e: self._show_help())
+            self.root.bind("<Control-h>", lambda e: self.notebook.select(self.tabs["History"]))
+        
+        def _toggle_preview(self) -> None:
+            """Toggle preview panel visibility."""
+            if self.preview_visible.get():
+                self.preview_frame.grid()
+            else:
+                self.preview_frame.grid_remove()
+        
+        def _quick_open(self) -> None:
+            """Quick file open dialog."""
+            path = filedialog.askopenfilename(
+                title="Open File",
+                filetypes=[
+                    ("All Supported", "*.png *.jpg *.jpeg *.gif *.mp3 *.mp4 *.pdf"),
+                    ("Images", "*.png *.jpg *.jpeg *.gif"),
+                    ("Audio", "*.mp3 *.mp4 *.m4a"),
+                    ("Video", "*.mp4 *.mov *.avi *.mkv"),
+                    ("PDF", "*.pdf"),
+                    ("All Files", "*.*"),
+                ]
+            )
+            if path:
+                self._add_recent_file(path)
+                self._load_file_to_appropriate_tab(path)
+        
+        def _quick_save(self) -> None:
+            pass  # Placeholder for quick save
+        
+        def _show_help(self) -> None:
+            """Show help dialog."""
+            help_text = """Steganography Suite - Quick Help
+
+Keyboard Shortcuts:
+  Ctrl+O: Open file
+  Ctrl+S: Quick save
+  Ctrl+H: View history
+  Ctrl+,: Settings
+  F1: Help
+
+Workflow:
+1. Hide Data: Embed secret data in images, audio, video, or PDFs
+2. Reveal Data: Extract hidden data from files
+3. Advanced: Frame-level embedding and GIF support
+4. Batch Operations: Process multiple files at once
+5. Analysis & Tools: Analyze images, detect steganography
+
+Tips:
+- Use PNG format for images (best quality)
+- Enable encryption for sensitive data
+- PRNG methods are more secure but need a key
+- Check capacity before embedding large files
+"""
+            win = tk.Toplevel(self.root)
+            win.title("Help")
+            win.geometry("600x500")
+            win.transient(self.root)
+            
+            # Apply theme based on mode
+            if self.dark_mode.get():
+                win.configure(bg="#2b2d31")
+                text = tk.Text(win, wrap=tk.WORD, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM,
+                             bg="#2b2d31", fg="#dcddde", insertbackground="#dcddde", borderwidth=0)
+            else:
+                win.configure(bg="SystemButtonFace")
+                text = tk.Text(win, wrap=tk.WORD, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM,
+                             bg="white", fg="black", insertbackground="black")
+            text.pack(fill=tk.BOTH, expand=True)
+            text.insert(tk.END, help_text)
+            text.config(state=tk.DISABLED)
+            
+            ttk.Button(win, text="Close", command=win.destroy, style="Primary.TButton").pack(pady=PADDING_SMALL)
+        
+        def _load_preferences(self) -> dict:
+            """Load user preferences."""
+            pref_path = Path.home() / ".steg_preferences.json"
+            if pref_path.exists():
+                try:
+                    return json.loads(pref_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            return {}
+        
+        def _save_preferences(self) -> None:
+            """Save user preferences."""
+            pref_path = Path.home() / ".steg_preferences.json"
+            self.preferences["geometry"] = self.root.geometry()
+            self.preferences["recent_files"] = self.recent_files[:10]
+            pref_path.write_text(json.dumps(self.preferences, indent=2), encoding="utf-8")
+        
+        def _on_close(self) -> None:
+            """Handle window close event."""
+            self._save_preferences()
+            self.root.destroy()
+        
+        def _add_recent_file(self, path: str) -> None:
+            """Add file to recent files list."""
+            if path in self.recent_files:
+                self.recent_files.remove(path)
+            self.recent_files.insert(0, path)
+            self.recent_files = self.recent_files[:10]
+            self._update_recent_files_ui()
+        
+        def _update_recent_files_ui(self) -> None:
+            """Update recent files display."""
+            for widget in self.recent_bar.winfo_children():
+                widget.destroy()
+            
+            if not self.recent_files:
+                ttk.Label(self.recent_bar, text="Recent: None", font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
+                return
+            
+            ttk.Label(self.recent_bar, text="Recent:", font=("TkDefaultFont", 8)).pack(side=tk.LEFT, padx=(0, PADDING_SMALL))
+            for i, path in enumerate(self.recent_files[:5]):
+                name = Path(path).name
+                if len(name) > 25:
+                    name = name[:22] + "..."
+                btn = ttk.Button(self.recent_bar, text=name, width=max(8, len(name)), 
+                               command=lambda p=path: self._load_file_to_appropriate_tab(p))
+                btn.pack(side=tk.LEFT, padx=2)
+                Tooltip(btn, path)
+        
+        def _load_file_to_appropriate_tab(self, path: str) -> None:
+            """Load file into the appropriate tab based on extension."""
+            ext = Path(path).suffix.lower()
+            if ext in (".png", ".jpg", ".jpeg", ".gif"):
+                self.notebook.select(self.tabs["Hide Data"])
+            elif ext in AUDIO_EXTS:
+                self.notebook.select(self.tabs["Hide Data"])
+            elif ext in VIDEO_EXTS:
+                self.notebook.select(self.tabs["Hide Data"])
+            elif ext == ".pdf":
+                self.notebook.select(self.tabs["Hide Data"])
+        
+        def _show_settings(self) -> None:
+            """Show settings dialog."""
+            settings = tk.Toplevel(self.root)
+            settings.title("Settings")
+            settings.geometry("500x400")
+            settings.transient(self.root)
+            settings.grab_set()
+            
+            # Apply theme colors to toplevel window
+            if self.dark_mode.get():
+                settings.configure(bg="#2b2d31")
+            else:
+                settings.configure(bg="SystemButtonFace")
+            
+            notebook = ttk.Notebook(settings)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
+            
+            # General settings
+            general = ttk.Frame(notebook)
+            notebook.add(general, text="General")
+            
+            ttk.Label(general, text="Default Compression:").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 0))
+            compress_var = tk.BooleanVar(value=self.preferences.get("default_compress", False))
+            ttk.Checkbutton(general, text="Enable compression by default", variable=compress_var).pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            
+            ttk.Label(general, text="Default Method:").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 0))
+            method_var = tk.StringVar(value=self.preferences.get("default_method", "lsb"))
+            ttk.Radiobutton(general, text="LSB (Simple)", variable=method_var, value="lsb").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            ttk.Radiobutton(general, text="LSB-PRNG (Randomized)", variable=method_var, value="lsb-prng").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            ttk.Radiobutton(general, text="LSB-Match (Most Secure)", variable=method_var, value="lsb-match-prng").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            
+            ttk.Separator(general, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
+            
+            ttk.Checkbutton(general, text="Show preview panel by default", 
+                          variable=self.preview_visible).pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            
+            # Appearance settings
+            appearance = ttk.Frame(notebook)
+            notebook.add(appearance, text="Appearance")
+            
+            ttk.Label(appearance, text="Theme:").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 0))
+            ttk.Checkbutton(appearance, text="Dark mode", variable=self.dark_mode, 
+                          command=lambda: self._apply_theme(self.dark_mode.get())).pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            
+            # Save button
+            btn_frame = ttk.Frame(settings)
+            btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
+            
+            def save_settings():
+                self.preferences["default_compress"] = compress_var.get()
+                self.preferences["default_method"] = method_var.get()
+                self._save_preferences()
+                messagebox.showinfo("Settings", "Settings saved successfully!")
+                settings.destroy()
+            
+            ttk.Button(btn_frame, text="Save", command=save_settings, width=BUTTON_WIDTH).pack(side=tk.RIGHT)
+            ttk.Button(btn_frame, text="Cancel", command=settings.destroy, width=BUTTON_WIDTH).pack(side=tk.RIGHT, padx=(0, PADDING_SMALL))
+
+        def _build_hide_data_tab(self, parent: ttk.Frame) -> None:
+            """Main 'Hide Data' tab with sub-tabs for different file types."""
+            sub_notebook = ttk.Notebook(parent)
+            sub_notebook.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            
+            image_frame = ttk.Frame(sub_notebook)
+            audio_frame = ttk.Frame(sub_notebook)
+            video_frame = ttk.Frame(sub_notebook)
+            pdf_frame = ttk.Frame(sub_notebook)
+            
+            sub_notebook.add(image_frame, text="Images")
+            sub_notebook.add(audio_frame, text="Audio")
+            sub_notebook.add(video_frame, text="Video")
+            sub_notebook.add(pdf_frame, text="PDF")
+            
+            self._build_image_tab(image_frame)
+            self._build_audio_tab(audio_frame)
+            self._build_video_tab(video_frame)
+            self._build_pdf_tab(pdf_frame)
+        
+        def _build_reveal_data_tab(self, parent: ttk.Frame) -> None:
+            """Main 'Reveal Data' tab for extraction."""
+            sub_notebook = ttk.Notebook(parent)
+            sub_notebook.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            
+            image_frame = ttk.Frame(sub_notebook)
+            audio_frame = ttk.Frame(sub_notebook)
+            video_frame = ttk.Frame(sub_notebook)
+            pdf_frame = ttk.Frame(sub_notebook)
+            
+            sub_notebook.add(image_frame, text="Images")
+            sub_notebook.add(audio_frame, text="Audio")
+            sub_notebook.add(video_frame, text="Video")
+            sub_notebook.add(pdf_frame, text="PDF")
+            
+            self._build_image_decode_only(image_frame)
+            self._build_audio_decode_only(audio_frame)
+            self._build_video_decode_only(video_frame)
+            self._build_pdf_decode_only(pdf_frame)
+        
+        def _build_advanced_tab(self, parent: ttk.Frame) -> None:
+            """Advanced features: video frames and GIFs."""
+            sub_notebook = ttk.Notebook(parent)
+            sub_notebook.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            
+            vf_frame = ttk.Frame(sub_notebook)
+            gif_frame = ttk.Frame(sub_notebook)
+            
+            sub_notebook.add(vf_frame, text="Video Frames")
+            sub_notebook.add(gif_frame, text="GIF")
+            
+            self._build_video_frames_tab(vf_frame)
+            self._build_gif_tab(gif_frame)
+
         def _build_image_tab(self, parent: ttk.Frame) -> None:
             container = ttk.Frame(parent)
-            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+            container.pack(fill=tk.BOTH, expand=True, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
 
             encode = ttk.Labelframe(container, text="Encode Image")
-            encode.pack(fill=tk.X, pady=(0, 12))
+            encode.pack(fill=tk.X, pady=(0, PADDING_MEDIUM))
 
             cover_var = tk.StringVar()
             msg_var = tk.StringVar()
@@ -2113,55 +2534,63 @@ def gui_main() -> None:
                 filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")],
                 on_change=self._update_image_preview,
             )
-            ttk.Label(encode, textvariable=capacity_var).pack(anchor=tk.W, padx=10, pady=(0, 6))
+            ttk.Label(encode, textvariable=capacity_var, foreground="#666").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
 
-            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
-            msg_entry = ttk.Entry(encode, textvariable=msg_var)
-            msg_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
-            paste_btn = ttk.Button(encode, text="Paste from Clipboard", command=lambda: msg_var.set(self._paste_clipboard()))
-            paste_btn.pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Separator(encode, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+            
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            msg_entry = PlaceholderEntry(encode, textvariable=msg_var, placeholder="Enter secret message...")
+            msg_entry.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+            paste_btn = ttk.Button(encode, text="Paste from Clipboard", command=lambda: msg_var.set(self._paste_clipboard()), width=BUTTON_WIDTH_LARGE)
+            paste_btn.pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
             Tooltip(paste_btn, "Paste text from the system clipboard")
 
             self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
 
-            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
-            pwd_entry = ttk.Entry(encode, textvariable=pwd_var, show="*")
-            pwd_entry.pack(fill=tk.X, padx=10)
-            ttk.Label(encode, textvariable=strength_var).pack(anchor=tk.W, padx=10, pady=(4, 8))
+            ttk.Separator(encode, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            pwd_entry_frame = PasswordEntry(encode, textvariable=pwd_var)
+            pwd_entry_frame.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, 4))
+            ttk.Label(encode, textvariable=strength_var, font=("TkDefaultFont", 8), foreground="#666").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
 
             method_row = ttk.Frame(encode)
-            method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            method_row.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
             ttk.Label(method_row, text="Method").pack(side=tk.LEFT)
             method_box = ttk.Combobox(method_row, textvariable=method_var, state="readonly",
                                       values=["lsb", "lsb-prng", "lsb-match-prng"], width=18)
-            method_box.pack(side=tk.LEFT, padx=8)
+            method_box.pack(side=tk.LEFT, padx=PADDING_SMALL)
             Tooltip(method_box, "LSB: simple. PRNG: randomized. LSB-match: less detectable.")
 
-            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
-            prng_entry = ttk.Entry(method_row, textvariable=prng_var, width=28)
-            prng_entry.pack(side=tk.LEFT, padx=8)
+            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(PADDING_LARGE, 0))
+            prng_entry = PlaceholderEntry(method_row, textvariable=prng_var, width=28, placeholder="Required for PRNG")
+            prng_entry.pack(side=tk.LEFT, padx=PADDING_SMALL)
             Tooltip(prng_entry, "Required for PRNG methods")
 
+            ttk.Separator(encode, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+
             options_row = ttk.Frame(encode)
-            options_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            options_row.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
             ttk.Checkbutton(options_row, text="Compress payload", variable=compress_var).pack(side=tk.LEFT)
-            ttk.Checkbutton(options_row, text="Auto-convert to PNG", variable=convert_var).pack(side=tk.LEFT, padx=(12, 0))
-            ttk.Label(options_row, text="Nested levels").pack(side=tk.LEFT, padx=(16, 4))
+            ttk.Checkbutton(options_row, text="Auto-convert to PNG", variable=convert_var).pack(side=tk.LEFT, padx=(PADDING_MEDIUM, 0))
+            ttk.Label(options_row, text="Nested levels").pack(side=tk.LEFT, padx=(PADDING_LARGE, 4))
             ttk.Spinbox(options_row, from_=1, to=5, textvariable=nest_var, width=4).pack(side=tk.LEFT)
 
-            ttk.Label(encode, text="Watermark text (optional)").pack(anchor=tk.W, padx=10)
-            ttk.Entry(encode, textvariable=watermark_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Watermark text (optional)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            PlaceholderEntry(encode, textvariable=watermark_var, placeholder="Optional watermark").pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
 
-            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
-            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
-            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
-            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            PlaceholderEntry(encode, textvariable=comment_var, placeholder="Optional comment").pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            PlaceholderEntry(encode, textvariable=expires_var, placeholder="e.g., 2026-12-31").pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
 
             self._save_row(encode, "Output file", out_var, def_ext=".png", filetypes=[("PNG", "*.png")])
 
             ttk.Button(
                 encode,
                 text="Embed Data",
+                style="Primary.TButton",
+                width=BUTTON_WIDTH_LARGE,
                 command=lambda: self._encode_image(
                     cover_var.get(),
                     msg_var.get(),
@@ -2177,7 +2606,7 @@ def gui_main() -> None:
                     comment_var.get(),
                     expires_var.get(),
                 ),
-            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+            ).pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_SMALL, PADDING_MEDIUM))
 
             def update_capacity(*_):
                 if cover_var.get():
@@ -2192,6 +2621,11 @@ def gui_main() -> None:
 
             cover_var.trace_add("write", update_capacity)
             pwd_var.trace_add("write", update_strength)
+
+        def _build_image_decode_only(self, parent: ttk.Frame) -> None:
+            """Image decode tab (for Reveal Data section)."""
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
 
             decode = ttk.Labelframe(container, text="Decode Image")
             decode.pack(fill=tk.X)
@@ -2211,7 +2645,7 @@ def gui_main() -> None:
             )
 
             dec_method_row = ttk.Frame(decode)
-            dec_method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            dec_method_row.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
             ttk.Label(dec_method_row, text="Method").pack(side=tk.LEFT)
             ttk.Combobox(
                 dec_method_row,
@@ -2219,18 +2653,23 @@ def gui_main() -> None:
                 state="readonly",
                 values=["lsb", "lsb-prng", "lsb-match-prng"],
                 width=18,
-            ).pack(side=tk.LEFT, padx=8)
-            ttk.Label(dec_method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
-            ttk.Entry(dec_method_row, textvariable=dec_prng_var, width=28).pack(side=tk.LEFT, padx=8)
+            ).pack(side=tk.LEFT, padx=PADDING_SMALL)
+            ttk.Label(dec_method_row, text="PRNG key").pack(side=tk.LEFT, padx=(PADDING_LARGE, 0))
+            PlaceholderEntry(dec_method_row, textvariable=dec_prng_var, width=28, placeholder="If PRNG was used").pack(side=tk.LEFT, padx=PADDING_SMALL)
 
-            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
-            ttk.Entry(decode, textvariable=dec_pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Separator(decode, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            pwd_frame = PasswordEntry(decode, textvariable=dec_pwd_var)
+            pwd_frame.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
 
             self._save_row(decode, "Output file (optional)", dec_out_var, def_ext=".txt", filetypes=[("All Files", "*.*")])
 
             ttk.Button(
                 decode,
                 text="Extract Data",
+                style="Primary.TButton",
+                width=BUTTON_WIDTH_LARGE,
                 command=lambda: self._decode_image(
                     stego_var.get(),
                     dec_pwd_var.get(),
@@ -2238,7 +2677,61 @@ def gui_main() -> None:
                     dec_method_var.get(),
                     dec_prng_var.get(),
                 ),
-            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+            ).pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_SMALL, PADDING_MEDIUM))
+
+        def _build_audio_decode_only(self, parent: ttk.Frame) -> None:
+            """Audio decode tab."""
+            audio_patterns = " ".join([f"*{ext}" for ext in AUDIO_EXT_LIST])
+            filetypes = [("Audio files", audio_patterns), ("All Files", "*.*")]
+            self._build_decode_only_tab(parent, media_type="audio", label="Audio", filetypes=filetypes)
+
+        def _build_video_decode_only(self, parent: ttk.Frame) -> None:
+            """Video decode tab."""
+            video_patterns = " ".join([f"*{ext}" for ext in VIDEO_EXT_LIST])
+            filetypes = [("Video files", video_patterns), ("All Files", "*.*")]
+            self._build_decode_only_tab(parent, media_type="video", label="Video", filetypes=filetypes)
+        
+        def _build_pdf_decode_only(self, parent: ttk.Frame) -> None:
+            """PDF decode tab."""
+            self._build_decode_only_tab(parent, media_type="pdf", label="PDF", filetypes=[("PDF", "*.pdf")])
+        
+        def _build_decode_only_tab(self, parent: ttk.Frame, media_type: str, label: str, filetypes: list) -> None:
+            """Generic decode-only tab."""
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM)
+
+            decode = ttk.Labelframe(container, text=f"Decode {label}")
+            decode.pack(fill=tk.X)
+
+            stego_var = tk.StringVar()
+            dec_pwd_var = tk.StringVar()
+            dec_out_var = tk.StringVar()
+            
+            preview_func = None
+            if media_type == "audio":
+                preview_func = self._update_audio_preview
+            elif media_type == "video":
+                preview_func = self._update_video_preview
+            elif media_type == "pdf":
+                preview_func = self._update_pdf_preview
+            
+            self._file_row(decode, f"{label} file", stego_var, filetypes=filetypes, on_change=preview_func)
+            
+            ttk.Separator(decode, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=PADDING_MEDIUM, pady=PADDING_SMALL)
+            
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            pwd_frame = PasswordEntry(decode, textvariable=dec_pwd_var)
+            pwd_frame.pack(fill=tk.X, padx=PADDING_MEDIUM, pady=(0, PADDING_SMALL))
+            
+            self._save_row(decode, "Output file", dec_out_var, def_ext=".bin", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract Data",
+                style="Primary.TButton",
+                width=BUTTON_WIDTH_LARGE,
+                command=lambda: self._decode_media(media_type, stego_var.get(), dec_pwd_var.get(), dec_out_var.get()),
+            ).pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_SMALL, PADDING_MEDIUM))
 
         def _build_audio_tab(self, parent: ttk.Frame) -> None:
             audio_patterns = " ".join([f"*{ext}" for ext in AUDIO_EXT_LIST])
@@ -2588,6 +3081,21 @@ def gui_main() -> None:
             ).pack(anchor=tk.W, padx=10, pady=(0, 10))
 
         def _build_tools_tab(self, parent: ttk.Frame) -> None:
+            """Analysis & Tools tab with sub-tabs."""
+            sub_notebook = ttk.Notebook(parent)
+            sub_notebook.pack(fill=tk.BOTH, expand=True, padx=PADDING_SMALL, pady=PADDING_SMALL)
+            
+            tools_frame = ttk.Frame(sub_notebook)
+            analysis_frame = ttk.Frame(sub_notebook)
+            
+            sub_notebook.add(tools_frame, text="Tools")
+            sub_notebook.add(analysis_frame, text="Analysis")
+            
+            self._build_tools_only(tools_frame)
+            self._build_analyze_tab(analysis_frame)
+        
+        def _build_tools_only(self, parent: ttk.Frame) -> None:
+            """Just the tools without analysis."""
             container = ttk.Frame(parent)
             container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
@@ -3866,7 +4374,16 @@ def gui_main() -> None:
             win = tk.Toplevel(self.root)
             win.title("Decoded Text")
             win.geometry("700x400")
-            txt = tk.Text(win, wrap=tk.WORD)
+            
+            # Apply theme based on mode
+            if self.dark_mode.get():
+                win.configure(bg="#2b2d31")
+                txt = tk.Text(win, wrap=tk.WORD, bg="#1e1f22", fg="#dcddde", 
+                            insertbackground="#dcddde", borderwidth=0, padx=8, pady=8)
+            else:
+                win.configure(bg="SystemButtonFace")
+                txt = tk.Text(win, wrap=tk.WORD, bg="white", fg="black",
+                            insertbackground="black", padx=8, pady=8)
             txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
             txt.insert(tk.END, text)
             txt.config(state=tk.DISABLED)
