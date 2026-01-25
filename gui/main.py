@@ -9,6 +9,8 @@ import sys
 import subprocess
 import json
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Optional, Callable
 from datetime import datetime
@@ -64,23 +66,54 @@ def gui_main() -> None:
     class PlaceholderEntry(ttk.Entry):
         """Entry widget with placeholder text support."""
         def __init__(self, parent, placeholder="", **kwargs):
+            # Extract textvariable if provided
+            self._string_var = kwargs.pop('textvariable', None)
             super().__init__(parent, **kwargs)
             self.placeholder = placeholder
             self.placeholder_color = "#999999"
-            self.default_color = "SystemWindowText"
+            # Use platform-appropriate default text color
+            if sys.platform == "win32":
+                self.default_color = "SystemWindowText"
+            else:
+                self.default_color = "black"
             self._has_placeholder = False
+            self._ignore_trace = False
+            
+            # Set up trace on the variable if provided
+            if self._string_var:
+                self._string_var.trace_add("write", self._on_var_changed)
             
             if placeholder:
                 self._show_placeholder()
             
             self.bind("<FocusIn>", self._on_focus_in)
             self.bind("<FocusOut>", self._on_focus_out)
+            self.bind("<KeyRelease>", self._on_key_release)
+        
+        def _on_var_changed(self, *args):
+            """Handle external changes to the StringVar."""
+            if not self._ignore_trace and self._string_var:
+                value = self._string_var.get()
+                if not value and not self._has_placeholder:
+                    self._show_placeholder()
+        
+        def _on_key_release(self, *args):
+            """Update StringVar when user types (without placeholder)."""
+            if not self._has_placeholder and self._string_var:
+                self._ignore_trace = True
+                self._string_var.set(self.get())
+                self._ignore_trace = False
         
         def _show_placeholder(self, *args):
             if not self.get():
                 self._has_placeholder = True
                 self.insert(0, self.placeholder)
                 self.config(foreground=self.placeholder_color)
+                # Don't set placeholder in the StringVar
+                if self._string_var:
+                    self._ignore_trace = True
+                    self._string_var.set("")
+                    self._ignore_trace = False
         
         def _on_focus_in(self, *args):
             if self._has_placeholder:
@@ -89,10 +122,20 @@ def gui_main() -> None:
                 self._has_placeholder = False
         
         def _on_focus_out(self, *args):
+            # Update StringVar with actual value
+            if not self._has_placeholder and self._string_var:
+                self._ignore_trace = True
+                self._string_var.set(self.get())
+                self._ignore_trace = False
+            
             if not self.get():
                 self._show_placeholder()
         
         def get_value(self):
+            """Get the actual value, returning empty string if showing placeholder."""
+            if self._has_placeholder:
+                return ""
+            return self.get()
             """Get actual value without placeholder."""
             return "" if self._has_placeholder else self.get()
 
@@ -1538,7 +1581,7 @@ Tips:
                 qr_box,
                 text="Generate QR",
                 command=lambda: self._run_command(
-                    ["python", str(Path(__file__).parent / "app.py"), "qr-generate",
+                    ["python", str(Path(__file__).parent.parent / "app.py"), "qr-generate",
                      "--text", qr_text.get(), "--out", qr_out.get()],
                     "QR generate",
                 ),
@@ -1569,7 +1612,7 @@ Tips:
             ttk.Entry(portable_box, textvariable=port_frame).pack(fill=tk.X, padx=10, pady=(0, 8))
 
             def run_portable():
-                cmd = ["python", str(Path(__file__).parent / "app.py"), "portable-decoder",
+                cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "portable-decoder",
                        "--input", port_in.get(), "--out", port_out.get()]
                 if port_method.get():
                     cmd.extend(["--method", port_method.get()])
@@ -1591,7 +1634,7 @@ Tips:
                 assoc_box,
                 text="Generate .reg",
                 command=lambda: self._run_command(
-                    ["python", str(Path(__file__).parent / "app.py"), "file-assoc", "--out", assoc_out.get()],
+                    ["python", str(Path(__file__).parent.parent / "app.py"), "file-assoc", "--out", assoc_out.get()],
                     "File association",
                 ),
             ).pack(anchor=tk.W, padx=10, pady=(0, 10))
@@ -2128,7 +2171,7 @@ Tips:
                     self.root.after(0, self.status.stop)
                     self.root.after(0, lambda: self._set_status(f"{action} error"))
                     self.root.after(0, lambda: self._add_history(action, "Error", str(exc)))
-                    self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+                    self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
 
             threading.Thread(target=task, daemon=True).start()
 
@@ -2165,7 +2208,7 @@ Tips:
                     return
 
             def build_cmd(input_img: str, out_img: str) -> list[str]:
-                cmd = ["python", str(Path(__file__).parent / "app.py"), "encode",
+                cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "encode",
                        "--image", input_img, "--out", out_img, "--method", method]
                 if payload_file:
                     cmd.extend(["--in-file", payload_file])
@@ -2238,7 +2281,7 @@ Tips:
                     self.root.after(0, self.status.stop)
                     self.root.after(0, lambda: self._set_status("Image encode failed"))
                     self.root.after(0, lambda: self._add_history("Image encode", "Failed", str(exc)))
-                    self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+                    self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
 
             self.root.after(0, lambda: self._set_status("Image encode in progress"))
             self.root.after(0, self.status.start)
@@ -2252,7 +2295,7 @@ Tips:
                 messagebox.showerror("Error", "PRNG key is required for the selected method.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "decode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "decode",
                    "--image", stego, "--method", method]
             if password:
                 cmd.extend(["--password", password])
@@ -2281,7 +2324,7 @@ Tips:
                 messagebox.showerror("Error", "Select an output file.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), f"{media_type}-encode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), f"{media_type}-encode",
                    f"--{media_type}", input_path, "--out", output]
             if payload_file:
                 cmd.extend(["--in-file", payload_file])
@@ -2306,7 +2349,7 @@ Tips:
                 messagebox.showerror("Error", "Select an output file.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), f"{media_type}-decode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), f"{media_type}-decode",
                    f"--{media_type}", input_path, "--out", output]
             if password:
                 cmd.extend(["--password", password])
@@ -2325,7 +2368,7 @@ Tips:
                 messagebox.showerror("Error", "Select an output PDF.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "pdf-encode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "pdf-encode",
                    "--pdf", pdf_path, "--out", output]
             if payload_file:
                 cmd.extend(["--in-file", payload_file])
@@ -2346,7 +2389,7 @@ Tips:
             if not pdf_path:
                 messagebox.showerror("Error", "Select a PDF file.")
                 return
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "pdf-decode", "--pdf", pdf_path]
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "pdf-decode", "--pdf", pdf_path]
             if output:
                 cmd.extend(["--out", output])
             if password:
@@ -2376,7 +2419,7 @@ Tips:
                 messagebox.showerror("Error", "PRNG key is required for the selected method.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "gif-encode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "gif-encode",
                    "--gif", gif_path, "--out", output, "--frame", str(frame_index), "--method", method]
             if payload_file:
                 cmd.extend(["--in-file", payload_file])
@@ -2404,7 +2447,7 @@ Tips:
                 messagebox.showerror("Error", "PRNG key is required for the selected method.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "gif-decode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "gif-decode",
                    "--gif", gif_path, "--frame", str(frame_index), "--method", method]
             if output:
                 cmd.extend(["--out", output])
@@ -2437,7 +2480,7 @@ Tips:
                 messagebox.showerror("Error", "PRNG key is required for the selected method.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "video-frame-encode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "video-frame-encode",
                    "--video", video_path, "--out", output, "--frame", str(frame_index), "--method", method]
             if payload_file:
                 cmd.extend(["--in-file", payload_file])
@@ -2465,7 +2508,7 @@ Tips:
                 messagebox.showerror("Error", "PRNG key is required for the selected method.")
                 return
 
-            cmd = ["python", str(Path(__file__).parent / "app.py"), "video-frame-decode",
+            cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "video-frame-decode",
                    "--video", video_path, "--frame", str(frame_index), "--method", method]
             if output:
                 cmd.extend(["--out", output])
@@ -2502,7 +2545,7 @@ Tips:
                 self.root.after(0, lambda: self._set_status("Batch encode in progress"))
                 for idx, path in enumerate(files, start=1):
                     out_path = Path(output_dir) / f"{Path(path).stem}_stego.png"
-                    cmd = ["python", str(Path(__file__).parent / "app.py"), "encode",
+                    cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "encode",
                            "--image", path, "--out", str(out_path), "--message", message,
                            "--method", method]
                     if password:
@@ -2543,7 +2586,7 @@ Tips:
                 self.root.after(0, lambda: self._set_status("Batch decode in progress"))
                 for idx, path in enumerate(files, start=1):
                     out_path = Path(output_dir) / f"{Path(path).stem}_decoded.bin"
-                    cmd = ["python", str(Path(__file__).parent / "app.py"), "decode",
+                    cmd = ["python", str(Path(__file__).parent.parent / "app.py"), "decode",
                            "--image", path, "--out", str(out_path), "--method", method]
                     if password:
                         cmd.extend(["--password", password])

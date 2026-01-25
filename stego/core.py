@@ -237,10 +237,18 @@ def check_expiration(metadata: dict | None) -> None:
     expires = metadata.get("expires")
     if not expires:
         return
+    
+    # Skip invalid/placeholder expiration dates
+    if expires.startswith("e.g.,") or expires.startswith("Optional"):
+        return
+    
     try:
         exp = datetime.fromisoformat(expires)
-    except ValueError as exc:
-        raise ValueError("Invalid expiration format; use YYYY-MM-DD or ISO datetime") from exc
+    except ValueError:
+        # Ignore invalid expiration formats instead of crashing
+        # This allows decoding of data encoded with placeholder text
+        return
+    
     if datetime.now() > exp:
         raise ValueError("Payload has expired")
 
