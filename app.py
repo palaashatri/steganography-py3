@@ -12,18 +12,33 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
+import sys
+import json
+import zipfile
+from typing import Tuple
 import logging
+from datetime import datetime
 import os
 import random
+from pathlib import Path
 import hashlib
+import zlib
+import subprocess
 from dataclasses import dataclass
 from typing import List, Sequence
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from PIL import Image
-from mutagen.id3 import ID3, APIC, TIT2, TPE1
+from PIL import Image, ImageSequence
+import imageio.v2 as imageio
+import imageio_ffmpeg
+import qrcode
+from PyPDF2 import PdfReader, PdfWriter
+import numpy as np
+from mutagen import File as MutagenFile
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TXXX
 from mutagen.mp4 import MP4
 
 
@@ -35,6 +50,16 @@ FLAG_LSB_MATCH = 0b0000_0100
 FLAG_PAYLOAD_IMAGE = 0b0000_1000  # Payload is image data (MP3/MP4 only)
 FLAG_PAYLOAD_TEXT = 0b0001_0000   # Payload is text/file data (MP3/MP4 only)
 FLAG_PAYLOAD_MP3 = 0b0010_0000    # Payload is MP3 file (MP4 only)
+FLAG_COMPRESSED = 0b0100_0000     # Payload is zlib-compressed
+FLAG_META = 0b1000_0000           # Payload contains metadata header
+
+AUDIO_EXT_LIST = [".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"]
+VIDEO_EXT_LIST = [".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]
+AUDIO_EXTS = set(AUDIO_EXT_LIST)
+VIDEO_EXTS = set(VIDEO_EXT_LIST)
+MP4_CONTAINER_EXTS = {".mp4", ".m4a", ".m4b", ".m4p", ".m4v", ".mov"}
+TAGGED_AUDIO_EXTS = {".wav", ".flac", ".ogg", ".opus", ".aac"}
+FFMPEG_VIDEO_EXTS = {".mkv", ".avi", ".webm"}
 
 DEFAULT_SALT_LEN = 16
 DEFAULT_NONCE_LEN = 12
@@ -210,6 +235,107 @@ def build_aad(flags: int, salt: bytes, nonce: bytes) -> bytes:
     return MAGIC + bytes([VERSION, flags]) + salt + nonce
 
 
+def apply_metadata(plaintext: bytes, metadata: dict | None) -> tuple[bytes, int]:
+    if not metadata:
+        return plaintext, 0
+    meta_bytes = json.dumps(metadata).encode("utf-8")
+    if len(meta_bytes) > 1_000_000:
+        raise ValueError("Metadata too large")
+    payload = len(meta_bytes).to_bytes(4, byteorder="big") + meta_bytes + plaintext
+    return payload, FLAG_META
+
+
+def extract_metadata(plaintext: bytes) -> tuple[dict | None, bytes]:
+    if len(plaintext) < 4:
+        raise ValueError("Payload too short for metadata header")
+    meta_len = int.from_bytes(plaintext[:4], byteorder="big")
+    if meta_len < 0 or meta_len > len(plaintext) - 4:
+        raise ValueError("Invalid metadata length")
+    meta_bytes = plaintext[4:4 + meta_len]
+    metadata = json.loads(meta_bytes.decode("utf-8")) if meta_len else None
+    return metadata, plaintext[4 + meta_len:]
+
+
+def check_expiration(metadata: dict | None) -> None:
+    if not metadata:
+        return
+    expires = metadata.get("expires")
+    if not expires:
+        return
+    try:
+        exp = datetime.fromisoformat(expires)
+    except ValueError as exc:
+        raise ValueError("Invalid expiration format; use YYYY-MM-DD or ISO datetime") from exc
+    if datetime.now() > exp:
+        raise ValueError("Payload has expired")
+
+
+def build_stego_payload(plaintext: bytes, flags: int, password: str | None,
+                        compress: bool, comment: str | None, expires: str | None) -> tuple[bytes, int, bytes, bytes]:
+    metadata = None
+    if comment or expires:
+        metadata = {"comment": comment or "", "expires": expires or ""}
+    plaintext, meta_flag = apply_metadata(plaintext, metadata)
+    if meta_flag:
+        flags |= meta_flag
+    if compress:
+        plaintext = zlib.compress(plaintext)
+        flags |= FLAG_COMPRESSED
+
+    salt = b""
+    nonce = b""
+    payload_bytes = plaintext
+    if password:
+        flags |= FLAG_ENCRYPTED
+        salt = os.urandom(DEFAULT_SALT_LEN)
+        nonce = os.urandom(DEFAULT_NONCE_LEN)
+        key = derive_key(password, salt)
+        aad = build_aad(flags, salt, nonce)
+        payload_bytes = AESGCM(key).encrypt(nonce, plaintext, aad)
+
+    header = StegoHeader(flags=flags, salt=salt, nonce=nonce, payload_len=len(payload_bytes)).to_bytes()
+    return header + payload_bytes, flags, salt, nonce
+
+
+def parse_stego_payload(stego_data: bytes, password: str | None) -> tuple[int, bytes, dict | None]:
+    if len(stego_data) < 12:
+        raise ValueError("Stego data too short")
+    header_prefix = stego_data[:12]
+    salt_len = header_prefix[6]
+    nonce_len = header_prefix[7]
+    extra_len = salt_len + nonce_len
+    if len(stego_data) < 12 + extra_len:
+        raise ValueError("Incomplete stego header")
+    header = parse_header(stego_data[: 12 + extra_len])
+    payload_start = 12 + extra_len
+    payload_end = payload_start + header.payload_len
+    if payload_end > len(stego_data):
+        raise ValueError("Stego payload length is invalid")
+    payload = stego_data[payload_start:payload_end]
+
+    if header.flags & FLAG_ENCRYPTED:
+        if not password:
+            raise ValueError("Password required to decrypt payload")
+        key = derive_key(password, header.salt)
+        aad = build_aad(header.flags, header.salt, header.nonce)
+        plaintext = AESGCM(key).decrypt(header.nonce, payload, aad)
+    else:
+        plaintext = payload
+
+    if header.flags & FLAG_COMPRESSED:
+        try:
+            plaintext = zlib.decompress(plaintext)
+        except zlib.error as exc:
+            raise ValueError("Compressed payload could not be decompressed") from exc
+
+    metadata = None
+    if header.flags & FLAG_META:
+        metadata, plaintext = extract_metadata(plaintext)
+        check_expiration(metadata)
+
+    return header.flags, plaintext, metadata
+
+
 def load_image(path: str) -> Image.Image:
     try:
         img = Image.open(path).convert("RGB")
@@ -231,9 +357,10 @@ def load_mp3(path: str) -> None:
         raise ValueError(f"Could not open MP3 file '{path}': {exc}") from exc
 
 
-def embed_data_in_mp3(mp3_path: str, output_path: str, password: str | None = None, 
-                      message: str | None = None, in_file: str | None = None, 
-                      image_path: str | None = None) -> None:
+def embed_data_in_mp3(mp3_path: str, output_path: str, password: str | None = None,
+                      message: str | None = None, in_file: str | None = None,
+                      image_path: str | None = None, compress: bool = False,
+                      comment: str | None = None, expires: str | None = None) -> None:
     """Embed text/file data or image into an MP3 file using ID3 tags with optional encryption."""
     import shutil
     
@@ -245,24 +372,24 @@ def embed_data_in_mp3(mp3_path: str, output_path: str, password: str | None = No
         raise ValueError("Provide --message, --in-file, or --image")
     if payload_count > 1:
         raise ValueError("Provide only one of: --message, --in-file, or --image")
-    
+
     flags = 0
     salt = b""
     nonce = b""
     plaintext = b""
     metadata = b""  # Additional metadata after payload
-    
+
     if image_path:
         # Handle image embedding
         flags |= FLAG_PAYLOAD_IMAGE
         image = load_image(image_path)
-        
+
         # Convert image to bytes
         image_bytes = bytearray()
         for pixel in image.getdata():
             image_bytes.extend(pixel)
         plaintext = bytes(image_bytes)
-        
+
         # Store image dimensions in metadata
         metadata = image.size[0].to_bytes(4, byteorder="big") + image.size[1].to_bytes(4, byteorder="big")
     else:
@@ -275,6 +402,18 @@ def embed_data_in_mp3(mp3_path: str, output_path: str, password: str | None = No
             with open(in_file, "rb") as f:
                 plaintext = f.read()
     
+    metadata = None
+    if comment or expires:
+        metadata = {"comment": comment or "", "expires": expires or ""}
+    plaintext, meta_flag = apply_metadata(plaintext, metadata)
+    if meta_flag:
+        flags |= meta_flag
+
+    # Optional compression
+    if compress:
+        plaintext = zlib.compress(plaintext)
+        flags |= FLAG_COMPRESSED
+
     # Encrypt (optional)
     payload_bytes = plaintext
     if password:
@@ -366,6 +505,26 @@ def extract_data_from_mp3(mp3_path: str, output_path: str, password: str | None 
     else:
         plaintext = payload
     
+    if header.flags & FLAG_COMPRESSED:
+        try:
+            plaintext = zlib.decompress(plaintext)
+        except zlib.error as exc:
+            raise ValueError("Compressed payload could not be decompressed") from exc
+
+    if header.flags & FLAG_META:
+        metadata, plaintext = extract_metadata(plaintext)
+        check_expiration(metadata)
+
+    if header.flags & FLAG_COMPRESSED:
+        try:
+            plaintext = zlib.decompress(plaintext)
+        except zlib.error as exc:
+            raise ValueError("Compressed payload could not be decompressed") from exc
+
+    if header.flags & FLAG_META:
+        metadata, plaintext = extract_metadata(plaintext)
+        check_expiration(metadata)
+
     # Determine payload type and extract accordingly
     if header.flags & FLAG_PAYLOAD_IMAGE:
         # Extract image
@@ -413,7 +572,9 @@ def load_mp4(path: str) -> None:
 
 def embed_data_in_mp4(mp4_path: str, output_path: str, password: str | None = None,
                       message: str | None = None, in_file: str | None = None,
-                      image_path: str | None = None, mp3_path: str | None = None) -> None:
+                      image_path: str | None = None, mp3_path: str | None = None,
+                      compress: bool = False, comment: str | None = None,
+                      expires: str | None = None) -> None:
     """Embed text/file data, image, or MP3 into an MP4 file using metadata with optional encryption."""
     import shutil
     
@@ -461,6 +622,18 @@ def embed_data_in_mp4(mp4_path: str, output_path: str, password: str | None = No
             with open(in_file, "rb") as f:
                 plaintext = f.read()
     
+    metadata = None
+    if comment or expires:
+        metadata = {"comment": comment or "", "expires": expires or ""}
+    plaintext, meta_flag = apply_metadata(plaintext, metadata)
+    if meta_flag:
+        flags |= meta_flag
+
+    # Optional compression
+    if compress:
+        plaintext = zlib.compress(plaintext)
+        flags |= FLAG_COMPRESSED
+
     # Encrypt (optional)
     payload_bytes = plaintext
     if password:
@@ -576,6 +749,444 @@ def extract_data_from_mp4(mp4_path: str, output_path: str, password: str | None 
         logging.info("Extracted text/file from MP4: %s", output_path)
 
 
+def _write_tagged_audio(output_path: str, stego_b64: str) -> None:
+    ext = Path(output_path).suffix.lower()
+    if ext == ".wav":
+        try:
+            tags = ID3(output_path)
+        except Exception:
+            tags = ID3()
+        tags.add(TXXX(encoding=3, desc="STEGO", text=stego_b64))
+        tags.save(output_path, v2_version=3)
+        return
+
+    audio = MutagenFile(output_path)
+    if audio is None:
+        raise ValueError("Unsupported audio format for tagging")
+    if audio.tags is None:
+        audio.add_tags()
+    audio["STEGO"] = [stego_b64]
+    audio.save()
+
+
+def _read_tagged_audio(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext == ".wav":
+        try:
+            tags = ID3(path)
+        except Exception as exc:
+            raise ValueError("No ID3 tags found in WAV file") from exc
+        for frame in tags.getall("TXXX"):
+            if frame.desc == "STEGO" and frame.text:
+                return frame.text[0]
+        raise ValueError("No embedded data found in WAV file")
+
+    audio = MutagenFile(path)
+    if audio is None or audio.tags is None:
+        raise ValueError("No embedded data found in audio file")
+    value = audio.tags.get("STEGO")
+    if not value:
+        raise ValueError("No embedded data found in audio file")
+    return value[0]
+
+
+def embed_data_in_audio(audio_path: str, output_path: str, password: str | None = None,
+                        message: str | None = None, in_file: str | None = None,
+                        image_path: str | None = None, compress: bool = False,
+                        comment: str | None = None, expires: str | None = None) -> None:
+    ext = Path(audio_path).suffix.lower()
+    if ext == ".mp3":
+        embed_data_in_mp3(
+            audio_path,
+            output_path,
+            password=password,
+            message=message,
+            in_file=in_file,
+            image_path=image_path,
+            compress=compress,
+            comment=comment,
+            expires=expires,
+        )
+        return
+    if ext in MP4_CONTAINER_EXTS:
+        if image_path:
+            embed_data_in_mp4(
+                audio_path,
+                output_path,
+                password=password,
+                message=message,
+                in_file=in_file,
+                image_path=image_path,
+                mp3_path=None,
+                compress=compress,
+                comment=comment,
+                expires=expires,
+            )
+            return
+        embed_data_in_mp4(
+            audio_path,
+            output_path,
+            password=password,
+            message=message,
+            in_file=in_file,
+            image_path=None,
+            mp3_path=None,
+            compress=compress,
+            comment=comment,
+            expires=expires,
+        )
+        return
+    if ext not in TAGGED_AUDIO_EXTS:
+        raise ValueError("Unsupported audio format")
+
+    if image_path:
+        raise ValueError("Image payloads are only supported for MP3/M4A/MOV containers")
+
+    payload = read_payload(message, in_file)
+    flags = FLAG_PAYLOAD_TEXT
+    stego_data, _flags, _salt, _nonce = build_stego_payload(payload, flags, password, compress, comment, expires)
+    stego_b64 = base64.b64encode(stego_data).decode("ascii")
+
+    import shutil
+    shutil.copy(audio_path, output_path)
+    _write_tagged_audio(output_path, stego_b64)
+    logging.info("Embedded text/file in audio: %s", output_path)
+
+
+def extract_data_from_audio(audio_path: str, output_path: str, password: str | None = None) -> None:
+    ext = Path(audio_path).suffix.lower()
+    if ext == ".mp3":
+        extract_data_from_mp3(audio_path, output_path, password=password)
+        return
+    if ext in MP4_CONTAINER_EXTS:
+        extract_data_from_mp4(audio_path, output_path, password=password)
+        return
+    if ext not in TAGGED_AUDIO_EXTS:
+        raise ValueError("Unsupported audio format")
+
+    stego_b64 = _read_tagged_audio(audio_path)
+    stego_data = base64.b64decode(stego_b64)
+    _flags, plaintext, _meta = parse_stego_payload(stego_data, password)
+    with open(output_path, "wb") as f:
+        f.write(plaintext)
+    logging.info("Extracted text/file from audio: %s", output_path)
+
+
+def _ffmpeg_embed_comment(input_path: str, output_path: str, comment: str) -> None:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg, "-y", "-i", input_path, "-c", "copy", "-metadata", f"comment={comment}", output_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError("ffmpeg failed to write metadata")
+
+
+def _ffmpeg_extract_comment(path: str) -> str:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg, "-i", path, "-f", "ffmetadata", "-"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    meta = result.stdout.splitlines()
+    for line in meta:
+        if line.startswith("comment="):
+            return line[len("comment="):]
+    raise ValueError("No embedded data found in video metadata")
+
+
+def embed_data_in_video(video_path: str, output_path: str, password: str | None = None,
+                        message: str | None = None, in_file: str | None = None,
+                        image_path: str | None = None, mp3_path: str | None = None,
+                        compress: bool = False, comment: str | None = None,
+                        expires: str | None = None) -> None:
+    ext = Path(video_path).suffix.lower()
+    if ext in MP4_CONTAINER_EXTS:
+        embed_data_in_mp4(
+            video_path,
+            output_path,
+            password=password,
+            message=message,
+            in_file=in_file,
+            image_path=image_path,
+            mp3_path=mp3_path,
+            compress=compress,
+            comment=comment,
+            expires=expires,
+        )
+        return
+    if ext not in FFMPEG_VIDEO_EXTS:
+        raise ValueError("Unsupported video format")
+    if image_path or mp3_path:
+        raise ValueError("Image/MP3 payloads are only supported for MP4/MOV containers")
+
+    payload = read_payload(message, in_file)
+    flags = FLAG_PAYLOAD_TEXT
+    stego_data, _flags, _salt, _nonce = build_stego_payload(payload, flags, password, compress, comment, expires)
+    stego_b64 = base64.b64encode(stego_data).decode("ascii")
+    _ffmpeg_embed_comment(video_path, output_path, stego_b64)
+    logging.info("Embedded text/file in video: %s", output_path)
+
+
+def extract_data_from_video(video_path: str, output_path: str, password: str | None = None) -> None:
+    ext = Path(video_path).suffix.lower()
+    if ext in MP4_CONTAINER_EXTS:
+        extract_data_from_mp4(video_path, output_path, password=password)
+        return
+    if ext not in FFMPEG_VIDEO_EXTS:
+        raise ValueError("Unsupported video format")
+
+    stego_b64 = _ffmpeg_extract_comment(video_path)
+    stego_data = base64.b64decode(stego_b64)
+    _flags, plaintext, _meta = parse_stego_payload(stego_data, password)
+    with open(output_path, "wb") as f:
+        f.write(plaintext)
+    logging.info("Extracted text/file from video: %s", output_path)
+
+
+def embed_data_in_pdf(pdf_path: str, output_path: str, password: str | None = None,
+                      message: str | None = None, in_file: str | None = None,
+                      compress: bool = False, comment: str | None = None,
+                      expires: str | None = None) -> None:
+    payload = read_payload(message, in_file)
+    flags = FLAG_PAYLOAD_TEXT
+    stego_data, flags, _salt, _nonce = build_stego_payload(payload, flags, password, compress, comment, expires)
+
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    meta = reader.metadata or {}
+    meta_dict = {str(k): str(v) for k, v in meta.items() if v is not None}
+    meta_dict["/StegData"] = base64.b64encode(stego_data).decode("ascii")
+    meta_dict["/StegFlags"] = str(flags)
+    writer.add_metadata(meta_dict)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
+def extract_data_from_pdf(pdf_path: str, output_path: str | None = None, password: str | None = None) -> bytes:
+    reader = PdfReader(pdf_path)
+    meta = reader.metadata or {}
+    stego_b64 = meta.get("/StegData")
+    if not stego_b64:
+        raise ValueError("No embedded data found in PDF")
+    stego_data = base64.b64decode(stego_b64)
+    _flags, plaintext, _meta = parse_stego_payload(stego_data, password)
+    if output_path:
+        with open(output_path, "wb") as f:
+            f.write(plaintext)
+    return plaintext
+
+
+def embed_stego_data_in_image(image: Image.Image, stego_data: bytes, method: str, prng_key: str | None) -> Image.Image:
+    bits = bytes_to_bits(stego_data)
+    if method == "lsb":
+        return embed_bits(image, bits)
+    if method in ("lsb-prng", "lsb-match-prng"):
+        if not prng_key:
+            raise ValueError("PRNG key required for PRNG methods")
+        rng = make_rng(prng_key)
+        return embed_bits_prng(image, bits, rng, lsb_match=(method == "lsb-match-prng"))
+    raise ValueError(f"Unknown method: {method}")
+
+
+def extract_stego_data_from_image(image: Image.Image, method: str, prng_key: str | None) -> bytes:
+    channels_len = len(flatten_channels(image))
+    if method == "lsb":
+        all_bits = extract_bits(image, channels_len)
+    elif method in ("lsb-prng", "lsb-match-prng"):
+        if not prng_key:
+            raise ValueError("PRNG key required for PRNG methods")
+        rng = make_rng(prng_key)
+        all_bits = extract_bits_prng(image, channels_len, rng)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    def read_bytes_from_bits(offset_bits: int, num_bytes: int) -> bytes:
+        bit_slice = all_bits[offset_bits: offset_bits + num_bytes * 8]
+        if len(bit_slice) < num_bytes * 8:
+            raise ValueError("Unexpected end of data while decoding")
+        return bits_to_bytes(bit_slice)
+
+    header_prefix = read_bytes_from_bits(0, 12)
+    salt_len = header_prefix[6]
+    nonce_len = header_prefix[7]
+    extra_len = salt_len + nonce_len
+    header = parse_header(header_prefix + read_bytes_from_bits(12 * 8, extra_len))
+    header_len = 12 + extra_len
+    payload_bits = all_bits[header_len * 8: (header_len + header.payload_len) * 8]
+    if len(payload_bits) < header.payload_len * 8:
+        raise ValueError("Image does not contain the full payload")
+    payload = bits_to_bytes(payload_bits)
+    return header.to_bytes() + payload
+
+
+def embed_data_in_gif(gif_path: str, output_path: str, frame_index: int,
+                      message: str | None = None, in_file: str | None = None,
+                      password: str | None = None, method: str = "lsb",
+                      prng_key: str | None = None, compress: bool = False,
+                      comment: str | None = None, expires: str | None = None) -> None:
+    payload = read_payload(message, in_file)
+    flags = FLAG_PAYLOAD_TEXT
+    stego_data, _flags, _salt, _nonce = build_stego_payload(payload, flags, password, compress, comment, expires)
+
+    image = Image.open(gif_path)
+    frames = [frame.copy().convert("RGB") for frame in ImageSequence.Iterator(image)]
+    if frame_index < 0 or frame_index >= len(frames):
+        raise ValueError("Frame index out of range")
+
+    max_bytes = max_payload_bytes(frames[frame_index])
+    if len(stego_data) > max_bytes:
+        raise ValueError("Payload too large for selected frame")
+
+    frames[frame_index] = embed_stego_data_in_image(frames[frame_index], stego_data, method, prng_key)
+    frames[0].save(output_path, save_all=True, append_images=frames[1:], loop=0, duration=image.info.get("duration", 100))
+
+
+def extract_data_from_gif(gif_path: str, frame_index: int, password: str | None = None,
+                          method: str = "lsb", prng_key: str | None = None) -> bytes:
+    image = Image.open(gif_path)
+    frames = [frame.copy().convert("RGB") for frame in ImageSequence.Iterator(image)]
+    if frame_index < 0 or frame_index >= len(frames):
+        raise ValueError("Frame index out of range")
+    stego_data = extract_stego_data_from_image(frames[frame_index], method, prng_key)
+    _flags, plaintext, _meta = parse_stego_payload(stego_data, password)
+    return plaintext
+
+
+def embed_data_in_video_frame(video_path: str, output_path: str, frame_index: int,
+                              message: str | None = None, in_file: str | None = None,
+                              password: str | None = None, method: str = "lsb",
+                              prng_key: str | None = None, compress: bool = False,
+                              comment: str | None = None, expires: str | None = None) -> None:
+    payload = read_payload(message, in_file)
+    flags = FLAG_PAYLOAD_TEXT
+    stego_data, _flags, _salt, _nonce = build_stego_payload(payload, flags, password, compress, comment, expires)
+
+    reader = imageio.get_reader(video_path)
+    meta = reader.get_meta_data()
+    fps = meta.get("fps", 24)
+    writer = imageio.get_writer(output_path, fps=fps)
+
+    embedded = False
+    for idx, frame in enumerate(reader):
+        if idx == frame_index:
+            pil = Image.fromarray(frame).convert("RGB")
+            max_bytes = max_payload_bytes(pil)
+            if len(stego_data) > max_bytes:
+                reader.close()
+                writer.close()
+                raise ValueError("Payload too large for selected frame")
+            stego_frame = embed_stego_data_in_image(pil, stego_data, method, prng_key)
+            writer.append_data(np.asarray(stego_frame))
+            embedded = True
+        else:
+            writer.append_data(frame)
+    reader.close()
+    writer.close()
+    if not embedded:
+        raise ValueError("Frame index out of range")
+
+
+def extract_data_from_video_frame(video_path: str, frame_index: int, password: str | None = None,
+                                  method: str = "lsb", prng_key: str | None = None) -> bytes:
+    reader = imageio.get_reader(video_path)
+    try:
+        frame = reader.get_data(frame_index)
+    except IndexError as exc:
+        reader.close()
+        raise ValueError("Frame index out of range") from exc
+    reader.close()
+    pil = Image.fromarray(frame).convert("RGB")
+    stego_data = extract_stego_data_from_image(pil, method, prng_key)
+    _flags, plaintext, _meta = parse_stego_payload(stego_data, password)
+    return plaintext
+
+
+def generate_qr_code(text: str, output_path: str) -> None:
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=2)
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save(output_path)
+
+
+def create_portable_decoder(stego_path: str, output_zip: str, method: str | None,
+                            prng_key: str | None, password: str | None, frame_index: int | None) -> None:
+    stego_file = Path(stego_path)
+    if not stego_file.exists():
+        raise FileNotFoundError("Stego file not found")
+    app_path = Path(__file__).resolve()
+    launcher = """#!/usr/bin/env python3
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).parent
+app = root / "app.py"
+target = root / "{target_name}"
+out = root / "decoded_output.bin"
+
+cmd = [sys.executable, str(app)] + {args}
+subprocess.run(cmd, check=False)
+print(f"Decoded output saved to: {out}")
+"""
+
+    ext = stego_file.suffix.lower()
+    if ext in (".png", ".jpg", ".jpeg", ".gif"):
+        args = ["decode", "--image", str(target), "--out", str(out)]
+        if method:
+            args += ["--method", method]
+        if prng_key:
+            args += ["--prng-key", prng_key]
+        if password:
+            args += ["--password", password]
+    elif ext in AUDIO_EXTS:
+        args = ["audio-decode", "--audio", str(target), "--out", str(out)]
+        if password:
+            args += ["--password", password]
+    elif ext in VIDEO_EXTS and frame_index is None:
+        args = ["video-decode", "--video", str(target), "--out", str(out)]
+        if password:
+            args += ["--password", password]
+    elif ext in VIDEO_EXTS and frame_index is not None:
+        args = ["video-frame-decode", "--video", str(target), "--frame", str(frame_index), "--out", str(out)]
+        if method:
+            args += ["--method", method]
+        if prng_key:
+            args += ["--prng-key", prng_key]
+        if password:
+            args += ["--password", password]
+    elif ext == ".pdf":
+        args = ["pdf-decode", "--pdf", str(target), "--out", str(out)]
+        if password:
+            args += ["--password", password]
+    else:
+        raise ValueError("Unsupported stego file type for portable decoder")
+
+    script = launcher.format(target_name=stego_file.name, args=repr(args))
+
+    with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(app_path, arcname="app.py")
+        zf.write(stego_file, arcname=stego_file.name)
+        zf.writestr("run_decode.py", script)
+
+
+def create_windows_file_association(output_reg: str, app_path: str, python_path: str) -> None:
+    ext = ".stgimg"
+    prog_id = "StegImageFile"
+    command = f'"{python_path}" "{app_path}" decode --image "%1" --out "%1.decoded"'
+    content = (
+        "Windows Registry Editor Version 5.00\n\n"
+        f"[HKEY_CLASSES_ROOT\\{ext}]\n"
+        f"@=\"{prog_id}\"\n\n"
+        f"[HKEY_CLASSES_ROOT\\{prog_id}]\n"
+        "@=\"Steganography Image\"\n\n"
+        f"[HKEY_CLASSES_ROOT\\{prog_id}\\shell\\open\\command]\n"
+        f"@=\"{command}\"\n"
+    )
+    Path(output_reg).write_text(content, encoding="utf-8")
+
+
 def read_payload(message: str | None, infile: str | None) -> bytes:
     if message and infile:
         raise ValueError("Provide either --message or --in-file, not both")
@@ -593,6 +1204,18 @@ def read_payload(message: str | None, infile: str | None) -> bytes:
 def encode_image(args: argparse.Namespace) -> None:
     image = load_image(args.image)
     plaintext = read_payload(args.message, args.in_file)
+
+    metadata = None
+    if args.comment or args.expires:
+        metadata = {"comment": args.comment or "", "expires": args.expires or ""}
+
+    plaintext, meta_flag = apply_metadata(plaintext, metadata)
+    if meta_flag:
+        flags |= meta_flag
+
+    if args.compress:
+        plaintext = zlib.compress(plaintext)
+        flags |= FLAG_COMPRESSED
 
     flags = 0
     salt = b""
@@ -692,6 +1315,16 @@ def decode_image(args: argparse.Namespace) -> None:
     else:
         plaintext = payload
 
+    if header.flags & FLAG_COMPRESSED:
+        try:
+            plaintext = zlib.decompress(plaintext)
+        except zlib.error as exc:
+            raise ValueError("Compressed payload could not be decompressed") from exc
+
+    if header.flags & FLAG_META:
+        metadata, plaintext = extract_metadata(plaintext)
+        check_expiration(metadata)
+
     if args.out:
         with open(args.out, "wb") as f:
             f.write(plaintext)
@@ -712,7 +1345,10 @@ def encode_mp3(args: argparse.Namespace) -> None:
         password=args.password,
         message=getattr(args, 'message', None),
         in_file=getattr(args, 'in_file', None),
-        image_path=getattr(args, 'image', None)
+        image_path=getattr(args, 'image', None),
+        compress=getattr(args, 'compress', False),
+        comment=getattr(args, 'comment', None),
+        expires=getattr(args, 'expires', None)
     )
 
 
@@ -730,7 +1366,10 @@ def encode_mp4(args: argparse.Namespace) -> None:
         message=getattr(args, 'message', None),
         in_file=getattr(args, 'in_file', None),
         image_path=getattr(args, 'image', None),
-        mp3_path=getattr(args, 'mp3', None)
+        mp3_path=getattr(args, 'mp3', None),
+        compress=getattr(args, 'compress', False),
+        comment=getattr(args, 'comment', None),
+        expires=getattr(args, 'expires', None)
     )
 
 
@@ -739,9 +1378,160 @@ def decode_mp4(args: argparse.Namespace) -> None:
     extract_data_from_mp4(args.mp4, args.out, password=args.password)
 
 
+def encode_audio(args: argparse.Namespace) -> None:
+    """Encode text/file data or image into an audio file."""
+    embed_data_in_audio(
+        args.audio,
+        args.out,
+        password=args.password,
+        message=getattr(args, "message", None),
+        in_file=getattr(args, "in_file", None),
+        image_path=getattr(args, "image", None),
+        compress=getattr(args, "compress", False),
+        comment=getattr(args, "comment", None),
+        expires=getattr(args, "expires", None),
+    )
+
+
+def decode_audio(args: argparse.Namespace) -> None:
+    """Decode text/file data from an audio file."""
+    extract_data_from_audio(args.audio, args.out, password=args.password)
+
+
+def encode_video(args: argparse.Namespace) -> None:
+    """Encode text/file data, image, or MP3 into a video file."""
+    embed_data_in_video(
+        args.video,
+        args.out,
+        password=args.password,
+        message=getattr(args, "message", None),
+        in_file=getattr(args, "in_file", None),
+        image_path=getattr(args, "image", None),
+        mp3_path=getattr(args, "mp3", None),
+        compress=getattr(args, "compress", False),
+        comment=getattr(args, "comment", None),
+        expires=getattr(args, "expires", None),
+    )
+
+
+def decode_video(args: argparse.Namespace) -> None:
+    """Decode text/file data from a video file."""
+    extract_data_from_video(args.video, args.out, password=args.password)
+
+
+def encode_pdf(args: argparse.Namespace) -> None:
+    embed_data_in_pdf(
+        args.pdf,
+        args.out,
+        password=args.password,
+        message=getattr(args, "message", None),
+        in_file=getattr(args, "in_file", None),
+        compress=getattr(args, "compress", False),
+        comment=getattr(args, "comment", None),
+        expires=getattr(args, "expires", None),
+    )
+
+
+def decode_pdf(args: argparse.Namespace) -> None:
+    plaintext = extract_data_from_pdf(args.pdf, args.out, password=args.password)
+    if not args.out:
+        try:
+            print(plaintext.decode("utf-8"))
+        except UnicodeDecodeError:
+            print(plaintext.decode("utf-8", errors="replace"))
+
+
+def encode_gif(args: argparse.Namespace) -> None:
+    embed_data_in_gif(
+        args.gif,
+        args.out,
+        frame_index=args.frame,
+        message=getattr(args, "message", None),
+        in_file=getattr(args, "in_file", None),
+        password=args.password,
+        method=args.method,
+        prng_key=args.prng_key,
+        compress=getattr(args, "compress", False),
+        comment=getattr(args, "comment", None),
+        expires=getattr(args, "expires", None),
+    )
+
+
+def decode_gif(args: argparse.Namespace) -> None:
+    plaintext = extract_data_from_gif(
+        args.gif,
+        frame_index=args.frame,
+        password=args.password,
+        method=args.method,
+        prng_key=args.prng_key,
+    )
+    if args.out:
+        with open(args.out, "wb") as f:
+            f.write(plaintext)
+    else:
+        try:
+            print(plaintext.decode("utf-8"))
+        except UnicodeDecodeError:
+            print(plaintext.decode("utf-8", errors="replace"))
+
+
+def encode_video_frame(args: argparse.Namespace) -> None:
+    embed_data_in_video_frame(
+        args.video,
+        args.out,
+        frame_index=args.frame,
+        message=getattr(args, "message", None),
+        in_file=getattr(args, "in_file", None),
+        password=args.password,
+        method=args.method,
+        prng_key=args.prng_key,
+        compress=getattr(args, "compress", False),
+        comment=getattr(args, "comment", None),
+        expires=getattr(args, "expires", None),
+    )
+
+
+def decode_video_frame(args: argparse.Namespace) -> None:
+    plaintext = extract_data_from_video_frame(
+        args.video,
+        frame_index=args.frame,
+        password=args.password,
+        method=args.method,
+        prng_key=args.prng_key,
+    )
+    if args.out:
+        with open(args.out, "wb") as f:
+            f.write(plaintext)
+    else:
+        try:
+            print(plaintext.decode("utf-8"))
+        except UnicodeDecodeError:
+            print(plaintext.decode("utf-8", errors="replace"))
+
+
+def generate_qr(args: argparse.Namespace) -> None:
+    generate_qr_code(args.text, args.out)
+
+
+def build_portable_decoder(args: argparse.Namespace) -> None:
+    create_portable_decoder(
+        args.input,
+        args.out,
+        method=args.method,
+        prng_key=args.prng_key,
+        password=args.password,
+        frame_index=args.frame,
+    )
+
+
+def generate_file_association(args: argparse.Namespace) -> None:
+    create_windows_file_association(args.out, str(Path(__file__).resolve()), sys.executable)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LSB image steganography, MP3/MP4 audio/video embedding")
+    parser = argparse.ArgumentParser(description="LSB image steganography with audio/video embedding")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--cli", action="store_true", help="Run CLI mode (do not launch GUI)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -751,6 +1541,9 @@ def build_parser() -> argparse.ArgumentParser:
     enc.add_argument("--message", help="Plaintext message to embed")
     enc.add_argument("--in-file", help="File whose contents to embed")
     enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    enc.add_argument("--comment", help="Optional comment metadata")
+    enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
     enc.add_argument(
         "--method",
         choices=["lsb", "lsb-prng", "lsb-match-prng"],
@@ -779,6 +1572,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dec.set_defaults(func=decode_image)
 
+    # Audio encoding subcommand
+    audio_enc = subparsers.add_parser("audio-encode", help="Embed text/file data or image into an audio file")
+    audio_enc.add_argument("--audio", required=True, help="Input audio file path")
+    audio_enc.add_argument("--out", required=True, help="Output audio file path")
+    audio_enc.add_argument("--image", help="Image file to embed (MP3/M4A/MOV only)")
+    audio_enc.add_argument("--message", help="Plaintext message to embed")
+    audio_enc.add_argument("--in-file", help="File whose contents to embed")
+    audio_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    audio_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    audio_enc.add_argument("--comment", help="Optional comment metadata")
+    audio_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
+    audio_enc.set_defaults(func=encode_audio)
+
+    # Audio decoding subcommand
+    audio_dec = subparsers.add_parser("audio-decode", help="Extract text/file data from an audio file")
+    audio_dec.add_argument("--audio", required=True, help="Audio file with embedded data")
+    audio_dec.add_argument("--out", required=True, help="Output file path (text/file)")
+    audio_dec.add_argument("--password", help="Password if data is encrypted")
+    audio_dec.set_defaults(func=decode_audio)
+
+    # Video encoding subcommand
+    video_enc = subparsers.add_parser("video-encode", help="Embed text/file data into a video file")
+    video_enc.add_argument("--video", required=True, help="Input video file path")
+    video_enc.add_argument("--out", required=True, help="Output video file path")
+    video_enc.add_argument("--image", help="Image file to embed (MP4/MOV only)")
+    video_enc.add_argument("--mp3", help="MP3 file to embed (MP4/MOV only)")
+    video_enc.add_argument("--message", help="Plaintext message to embed")
+    video_enc.add_argument("--in-file", help="File whose contents to embed")
+    video_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    video_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    video_enc.add_argument("--comment", help="Optional comment metadata")
+    video_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
+    video_enc.set_defaults(func=encode_video)
+
+    # Video decoding subcommand
+    video_dec = subparsers.add_parser("video-decode", help="Extract text/file data from a video file")
+    video_dec.add_argument("--video", required=True, help="Video file with embedded data")
+    video_dec.add_argument("--out", required=True, help="Output file path (text/file)")
+    video_dec.add_argument("--password", help="Password if data is encrypted")
+    video_dec.set_defaults(func=decode_video)
+
     # MP3 encoding subcommand
     mp3_enc = subparsers.add_parser("mp3-encode", help="Embed text/file data or image into an MP3 file")
     mp3_enc.add_argument("--mp3", required=True, help="Input MP3 file path")
@@ -787,6 +1621,9 @@ def build_parser() -> argparse.ArgumentParser:
     mp3_enc.add_argument("--message", help="Plaintext message to embed")
     mp3_enc.add_argument("--in-file", help="File whose contents to embed")
     mp3_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    mp3_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    mp3_enc.add_argument("--comment", help="Optional comment metadata")
+    mp3_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
     mp3_enc.set_defaults(func=encode_mp3)
 
     # MP3 decoding subcommand
@@ -805,6 +1642,9 @@ def build_parser() -> argparse.ArgumentParser:
     mp4_enc.add_argument("--in-file", help="File whose contents to embed")
     mp4_enc.add_argument("--mp3", help="MP3 file to embed")
     mp4_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    mp4_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    mp4_enc.add_argument("--comment", help="Optional comment metadata")
+    mp4_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
     mp4_enc.set_defaults(func=encode_mp4)
 
     # MP4 decoding subcommand
@@ -814,10 +1654,100 @@ def build_parser() -> argparse.ArgumentParser:
     mp4_dec.add_argument("--password", help="Password if data is encrypted")
     mp4_dec.set_defaults(func=decode_mp4)
 
+    pdf_enc = subparsers.add_parser("pdf-encode", help="Embed text/file data into a PDF metadata")
+    pdf_enc.add_argument("--pdf", required=True, help="Input PDF file")
+    pdf_enc.add_argument("--out", required=True, help="Output PDF file")
+    pdf_enc.add_argument("--message", help="Plaintext message to embed")
+    pdf_enc.add_argument("--in-file", help="File whose contents to embed")
+    pdf_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    pdf_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    pdf_enc.add_argument("--comment", help="Optional comment metadata")
+    pdf_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
+    pdf_enc.set_defaults(func=encode_pdf)
+
+    pdf_dec = subparsers.add_parser("pdf-decode", help="Extract embedded data from a PDF")
+    pdf_dec.add_argument("--pdf", required=True, help="PDF file with embedded data")
+    pdf_dec.add_argument("--out", help="Output file path (optional)")
+    pdf_dec.add_argument("--password", help="Password if data is encrypted")
+    pdf_dec.set_defaults(func=decode_pdf)
+
+    gif_enc = subparsers.add_parser("gif-encode", help="Embed data into a GIF frame")
+    gif_enc.add_argument("--gif", required=True, help="Input GIF file")
+    gif_enc.add_argument("--out", required=True, help="Output GIF file")
+    gif_enc.add_argument("--frame", type=int, default=0, help="Frame index for embedding")
+    gif_enc.add_argument("--message", help="Plaintext message to embed")
+    gif_enc.add_argument("--in-file", help="File whose contents to embed")
+    gif_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    gif_enc.add_argument("--method", choices=["lsb", "lsb-prng", "lsb-match-prng"], default="lsb")
+    gif_enc.add_argument("--prng-key", help="Key string to seed PRNG embedding")
+    gif_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    gif_enc.add_argument("--comment", help="Optional comment metadata")
+    gif_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
+    gif_enc.set_defaults(func=encode_gif)
+
+    gif_dec = subparsers.add_parser("gif-decode", help="Extract data from a GIF frame")
+    gif_dec.add_argument("--gif", required=True, help="GIF file with embedded data")
+    gif_dec.add_argument("--frame", type=int, default=0, help="Frame index for extraction")
+    gif_dec.add_argument("--out", help="Output file path (optional)")
+    gif_dec.add_argument("--password", help="Password if data is encrypted")
+    gif_dec.add_argument("--method", choices=["lsb", "lsb-prng", "lsb-match-prng"], default="lsb")
+    gif_dec.add_argument("--prng-key", help="PRNG key string if embedding used PRNG")
+    gif_dec.set_defaults(func=decode_gif)
+
+    vf_enc = subparsers.add_parser("video-frame-encode", help="Embed data into a specific video frame")
+    vf_enc.add_argument("--video", required=True, help="Input video file")
+    vf_enc.add_argument("--out", required=True, help="Output video file")
+    vf_enc.add_argument("--frame", type=int, default=0, help="Frame index for embedding")
+    vf_enc.add_argument("--message", help="Plaintext message to embed")
+    vf_enc.add_argument("--in-file", help="File whose contents to embed")
+    vf_enc.add_argument("--password", help="Password for AES-256-GCM encryption")
+    vf_enc.add_argument("--method", choices=["lsb", "lsb-prng", "lsb-match-prng"], default="lsb")
+    vf_enc.add_argument("--prng-key", help="Key string to seed PRNG embedding")
+    vf_enc.add_argument("--compress", action="store_true", help="Compress payload before embedding")
+    vf_enc.add_argument("--comment", help="Optional comment metadata")
+    vf_enc.add_argument("--expires", help="Optional expiration date (YYYY-MM-DD or ISO datetime)")
+    vf_enc.set_defaults(func=encode_video_frame)
+
+    vf_dec = subparsers.add_parser("video-frame-decode", help="Extract data from a specific video frame")
+    vf_dec.add_argument("--video", required=True, help="Video file with embedded data")
+    vf_dec.add_argument("--frame", type=int, default=0, help="Frame index for extraction")
+    vf_dec.add_argument("--out", help="Output file path (optional)")
+    vf_dec.add_argument("--password", help="Password if data is encrypted")
+    vf_dec.add_argument("--method", choices=["lsb", "lsb-prng", "lsb-match-prng"], default="lsb")
+    vf_dec.add_argument("--prng-key", help="PRNG key string if embedding used PRNG")
+    vf_dec.set_defaults(func=decode_video_frame)
+
+    qr_gen = subparsers.add_parser("qr-generate", help="Generate a QR code image from text")
+    qr_gen.add_argument("--text", required=True, help="Text to encode in QR")
+    qr_gen.add_argument("--out", required=True, help="Output PNG file")
+    qr_gen.set_defaults(func=generate_qr)
+
+    portable = subparsers.add_parser("portable-decoder", help="Create a portable decoder package (zip)")
+    portable.add_argument("--input", required=True, help="Stego file to include")
+    portable.add_argument("--out", required=True, help="Output zip file")
+    portable.add_argument("--method", choices=["lsb", "lsb-prng", "lsb-match-prng"], help="Method for image decoding")
+    portable.add_argument("--prng-key", help="PRNG key for image decoding")
+    portable.add_argument("--password", help="Password for encrypted data")
+    portable.add_argument("--frame", type=int, help="Frame index for GIF/video-frame decode")
+    portable.set_defaults(func=build_portable_decoder)
+
+    assoc = subparsers.add_parser("file-assoc", help="Generate Windows file association registry file")
+    assoc.add_argument("--out", required=True, help="Output .reg file path")
+    assoc.set_defaults(func=generate_file_association)
+
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    if argv is None and len(sys.argv) == 1:
+        gui_main()
+        return
+
+    if argv is None and sys.argv[1:] == ["--cli"]:
+        parser = build_parser()
+        parser.print_help()
+        return
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -831,6 +1761,2130 @@ def main(argv: Sequence[str] | None = None) -> None:
     except Exception as exc:  # noqa: BLE001
         logging.error("%s", exc)
         raise SystemExit(1)
+
+
+# =============================
+# GUI (Native ttk)
+# =============================
+
+
+def gui_main() -> None:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from dataclasses import dataclass
+    import tempfile
+    import time
+    import json
+    import base64
+    from typing import Optional, Callable
+    from PIL import Image, ImageChops, ImageStat, ImageDraw, ImageTk
+
+    try:
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+        dnd_available = True
+    except Exception:
+        dnd_available = False
+        DND_FILES = None
+        TkinterDnD = None
+
+    class CapacityCalculator:
+        @staticmethod
+        def image_lsb_capacity(path: str) -> int:
+            try:
+                img = Image.open(path)
+                pixels = img.width * img.height * len(img.getbands())
+                return max(0, (pixels // 8) - 100)
+            except Exception:
+                return 0
+
+        @staticmethod
+        def format_bytes(value: int) -> str:
+            size = float(value)
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if size < 1024:
+                    return f"{size:.1f} {unit}"
+                size /= 1024
+            return f"{size:.1f} PB"
+
+    class PasswordValidator:
+        @staticmethod
+        def check_strength(password: str) -> tuple[str, str]:
+            if not password:
+                return ("none", "No password")
+
+            score = 0
+            if len(password) >= 12:
+                score += 1
+            if len(password) >= 20:
+                score += 1
+            if any(c.isupper() for c in password):
+                score += 1
+            if any(c.islower() for c in password):
+                score += 1
+            if any(c.isdigit() for c in password):
+                score += 1
+            if any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
+                score += 1
+
+            levels = {
+                0: ("none", "No password"),
+                1: ("weak", "Weak"),
+                2: ("fair", "Fair"),
+                3: ("good", "Good"),
+                4: ("strong", "Strong"),
+                5: ("strong", "Strong"),
+                6: ("very_strong", "Very Strong"),
+            }
+            return levels.get(score, ("very_strong", "Very Strong"))
+
+    def compute_psnr(img_a: Image.Image, img_b: Image.Image) -> float:
+        diff = ImageChops.difference(img_a, img_b)
+        stat = ImageStat.Stat(diff)
+        mse = sum((v ** 2 for v in stat.mean)) / len(stat.mean)
+        if mse == 0:
+            return float("inf")
+        return 20 * (255.0 / (mse ** 0.5))
+
+    def normalize_dnd_files(data: str, widget: tk.Widget) -> list[str]:
+        if not data:
+            return []
+        return list(widget.tk.splitlist(data))
+
+    class Tooltip:
+        def __init__(self, widget: tk.Widget, text: str):
+            self.widget = widget
+            self.text = text
+            self.tip: Optional[tk.Toplevel] = None
+            widget.bind("<Enter>", self.show)
+            widget.bind("<Leave>", self.hide)
+
+        def show(self, _event=None):
+            if self.tip or not self.text:
+                return
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+            self.tip = tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            label = ttk.Label(tip, text=self.text, padding=(8, 4))
+            label.pack()
+
+        def hide(self, _event=None):
+            if self.tip:
+                self.tip.destroy()
+                self.tip = None
+
+    @dataclass
+    class HistoryItem:
+        timestamp: str
+        action: str
+        status: str
+        details: str
+
+    class StatusBar(ttk.Frame):
+        def __init__(self, parent: tk.Widget):
+            super().__init__(parent)
+            self.message = ttk.Label(self, text="Ready")
+            self.message.pack(side=tk.LEFT, padx=(8, 12))
+            self.progress = ttk.Progressbar(self, mode="indeterminate", length=200)
+            self.progress.pack(side=tk.RIGHT, padx=8, pady=2)
+
+        def set_status(self, text: str) -> None:
+            self.message.config(text=text)
+
+        def start(self) -> None:
+            self.progress.start(10)
+
+        def stop(self) -> None:
+            self.progress.stop()
+
+    class SteganographyGUI:
+        def __init__(self, root: tk.Tk):
+            self.root = root
+            self.root.title("Steganography Suite")
+            self.root.geometry("1300x900")
+            self.root.minsize(1000, 700)
+            self.history: list[HistoryItem] = []
+            self.dark_mode = tk.BooleanVar(value=self._detect_dark_mode())
+            self._apply_native_theme()
+            self._build_ui()
+            self._apply_theme(self.dark_mode.get())
+
+        def _apply_native_theme(self) -> None:
+            style = ttk.Style()
+            if sys.platform == "win32":
+                for name in ("vista", "xpnative", "winnative"):
+                    if name in style.theme_names():
+                        style.theme_use(name)
+                        return
+            elif sys.platform == "darwin":
+                if "aqua" in style.theme_names():
+                    style.theme_use("aqua")
+                    return
+            style.theme_use(style.theme_use())
+
+        def _apply_theme(self, dark: bool) -> None:
+            style = ttk.Style()
+            if not dark:
+                try:
+                    self.root.option_clear()
+                except Exception:
+                    pass
+                self._apply_native_theme()
+                self.root.configure(bg="SystemButtonFace")
+                return
+
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+
+            bg = "#1e1f22"
+            panel = "#2b2d31"
+            surface = "#313338"
+            fg = "#e6e6e6"
+            muted = "#b4b4b4"
+            accent = "#3b82f6"
+
+            self.root.configure(bg=bg)
+            self.root.option_add("*Listbox.background", panel)
+            self.root.option_add("*Listbox.foreground", fg)
+            self.root.option_add("*Listbox.selectBackground", accent)
+            self.root.option_add("*Listbox.selectForeground", "#ffffff")
+            self.root.option_add("*Listbox.insertBackground", fg)
+
+            style.configure("TFrame", background=bg)
+            style.configure("TLabel", background=bg, foreground=fg)
+            style.configure("TLabelframe", background=bg, foreground=fg, bordercolor=surface)
+            style.configure("TLabelframe.Label", background=bg, foreground=fg)
+            style.configure("TButton", background=surface, foreground=fg)
+            style.map("TButton", background=[("active", panel)])
+            style.configure("TEntry", fieldbackground=panel, foreground=fg, insertcolor=fg)
+            style.configure("TCombobox", fieldbackground=panel, foreground=fg)
+            style.map("TCombobox", fieldbackground=[("readonly", panel)], foreground=[("readonly", fg)])
+            style.configure("TCheckbutton", background=bg, foreground=fg)
+            style.configure("TRadiobutton", background=bg, foreground=fg)
+            style.configure("TNotebook", background=bg, borderwidth=0)
+            style.configure("TNotebook.Tab", background=surface, foreground=fg, padding=(12, 6))
+            style.map(
+                "TNotebook.Tab",
+                background=[("selected", panel)],
+                foreground=[("selected", fg)],
+                padding=[("selected", (12, 6)), ("!selected", (12, 6))],
+            )
+            style.configure("Treeview", background=panel, fieldbackground=panel, foreground=fg)
+            style.configure("Treeview.Heading", background=surface, foreground=fg)
+            style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "#ffffff")])
+            style.configure("TProgressbar", background=accent, troughcolor=surface)
+
+        def _detect_dark_mode(self) -> bool:
+            try:
+                if sys.platform == "win32":
+                    import winreg
+
+                    key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                        return value == 0
+                if sys.platform == "darwin":
+                    result = subprocess.run(
+                        ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    return result.returncode == 0 and "Dark" in result.stdout
+            except Exception:
+                return False
+            return False
+
+        def _build_ui(self) -> None:
+            header = ttk.Frame(self.root)
+            header.pack(side=tk.TOP, fill=tk.X, padx=12, pady=8)
+            ttk.Label(header, text="Steganography Suite", font=("TkDefaultFont", 16, "bold")).pack(side=tk.TOP)
+
+            content = ttk.Frame(self.root)
+            content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            content.columnconfigure(0, minsize=320)
+            content.columnconfigure(1, weight=1)
+            content.columnconfigure(2, minsize=320)
+            content.rowconfigure(0, weight=1)
+
+            ttk.Frame(content, width=320).grid(row=0, column=0, sticky="ns")
+
+            main_center = ttk.Frame(content)
+            main_center.grid(row=0, column=1, sticky="nsew")
+            main_center.rowconfigure(0, weight=1)
+            main_center.columnconfigure(0, weight=1)
+
+            self.notebook = ttk.Notebook(main_center)
+            self.notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+            self.preview_frame = ttk.Labelframe(content, text="Preview")
+            self.preview_frame.grid(row=0, column=2, sticky="ns", padx=(8, 0), pady=4)
+            self.preview_frame.columnconfigure(0, weight=1)
+
+            self._preview_image_ref = None
+            self._preview_video_ref = None
+
+            image_box = ttk.Labelframe(self.preview_frame, text="Image")
+            image_box.pack(fill=tk.X, padx=8, pady=(8, 4))
+            self.preview_image = ttk.Label(image_box, text="No image selected")
+            self.preview_image.pack(fill=tk.X, padx=6, pady=6)
+
+            audio_box = ttk.Labelframe(self.preview_frame, text="Audio")
+            audio_box.pack(fill=tk.X, padx=8, pady=4)
+            self.preview_audio = ttk.Label(audio_box, text="No audio selected", wraplength=260, justify=tk.LEFT)
+            self.preview_audio.pack(fill=tk.X, padx=6, pady=6)
+
+            video_box = ttk.Labelframe(self.preview_frame, text="Video")
+            video_box.pack(fill=tk.X, padx=8, pady=4)
+            self.preview_video = ttk.Label(video_box, text="No video selected")
+            self.preview_video.pack(fill=tk.X, padx=6, pady=6)
+
+            pdf_box = ttk.Labelframe(self.preview_frame, text="PDF")
+            pdf_box.pack(fill=tk.X, padx=8, pady=(4, 8))
+            self.preview_pdf = ttk.Label(pdf_box, text="No PDF selected", wraplength=260, justify=tk.LEFT)
+            self.preview_pdf.pack(fill=tk.X, padx=6, pady=6)
+
+            self.tabs = {
+                "Image": ttk.Frame(self.notebook),
+                "Audio": ttk.Frame(self.notebook),
+                "Video": ttk.Frame(self.notebook),
+                "Video Frames": ttk.Frame(self.notebook),
+                "GIF": ttk.Frame(self.notebook),
+                "PDF": ttk.Frame(self.notebook),
+                "Tools": ttk.Frame(self.notebook),
+                "Batch": ttk.Frame(self.notebook),
+                "Analyze": ttk.Frame(self.notebook),
+                "History": ttk.Frame(self.notebook),
+            }
+
+            for name, frame in self.tabs.items():
+                self.notebook.add(frame, text=name)
+
+            self._build_image_tab(self.tabs["Image"])
+            self._build_audio_tab(self.tabs["Audio"])
+            self._build_video_tab(self.tabs["Video"])
+            self._build_video_frames_tab(self.tabs["Video Frames"])
+            self._build_gif_tab(self.tabs["GIF"])
+            self._build_pdf_tab(self.tabs["PDF"])
+            self._build_tools_tab(self.tabs["Tools"])
+            self._build_batch_tab(self.tabs["Batch"])
+            self._build_analyze_tab(self.tabs["Analyze"])
+            self._build_history_tab(self.tabs["History"])
+
+            self.status = StatusBar(self.root)
+            self.status.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def _build_image_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            encode = ttk.Labelframe(container, text="Encode Image")
+            encode.pack(fill=tk.X, pady=(0, 12))
+
+            cover_var = tk.StringVar()
+            msg_var = tk.StringVar()
+            payload_file_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_var = tk.StringVar()
+            method_var = tk.StringVar(value="lsb")
+            prng_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+            convert_var = tk.BooleanVar(value=True)
+            watermark_var = tk.StringVar()
+            nest_var = tk.IntVar(value=1)
+            comment_var = tk.StringVar()
+            expires_var = tk.StringVar()
+            capacity_var = tk.StringVar(value="Capacity: ")
+            strength_var = tk.StringVar(value="Strength: ")
+
+            self.image_vars = {
+                "method": method_var,
+                "prng_key": prng_var,
+                "compress": compress_var,
+                "auto_convert": convert_var,
+                "watermark": watermark_var,
+                "nest_levels": nest_var,
+            }
+
+            self._file_row(
+                encode,
+                "Cover image",
+                cover_var,
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")],
+                on_change=self._update_image_preview,
+            )
+            ttk.Label(encode, textvariable=capacity_var).pack(anchor=tk.W, padx=10, pady=(0, 6))
+
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
+            msg_entry = ttk.Entry(encode, textvariable=msg_var)
+            msg_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
+            paste_btn = ttk.Button(encode, text="Paste from Clipboard", command=lambda: msg_var.set(self._paste_clipboard()))
+            paste_btn.pack(anchor=tk.W, padx=10, pady=(0, 8))
+            Tooltip(paste_btn, "Paste text from the system clipboard")
+
+            self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
+
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            pwd_entry = ttk.Entry(encode, textvariable=pwd_var, show="*")
+            pwd_entry.pack(fill=tk.X, padx=10)
+            ttk.Label(encode, textvariable=strength_var).pack(anchor=tk.W, padx=10, pady=(4, 8))
+
+            method_row = ttk.Frame(encode)
+            method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(method_row, text="Method").pack(side=tk.LEFT)
+            method_box = ttk.Combobox(method_row, textvariable=method_var, state="readonly",
+                                      values=["lsb", "lsb-prng", "lsb-match-prng"], width=18)
+            method_box.pack(side=tk.LEFT, padx=8)
+            Tooltip(method_box, "LSB: simple. PRNG: randomized. LSB-match: less detectable.")
+
+            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            prng_entry = ttk.Entry(method_row, textvariable=prng_var, width=28)
+            prng_entry.pack(side=tk.LEFT, padx=8)
+            Tooltip(prng_entry, "Required for PRNG methods")
+
+            options_row = ttk.Frame(encode)
+            options_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Checkbutton(options_row, text="Compress payload", variable=compress_var).pack(side=tk.LEFT)
+            ttk.Checkbutton(options_row, text="Auto-convert to PNG", variable=convert_var).pack(side=tk.LEFT, padx=(12, 0))
+            ttk.Label(options_row, text="Nested levels").pack(side=tk.LEFT, padx=(16, 4))
+            ttk.Spinbox(options_row, from_=1, to=5, textvariable=nest_var, width=4).pack(side=tk.LEFT)
+
+            ttk.Label(encode, text="Watermark text (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=watermark_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            self._save_row(encode, "Output file", out_var, def_ext=".png", filetypes=[("PNG", "*.png")])
+
+            ttk.Button(
+                encode,
+                text="Embed Data",
+                command=lambda: self._encode_image(
+                    cover_var.get(),
+                    msg_var.get(),
+                    payload_file_var.get(),
+                    pwd_var.get(),
+                    out_var.get(),
+                    method_var.get(),
+                    prng_var.get(),
+                    compress_var.get(),
+                    convert_var.get(),
+                    watermark_var.get(),
+                    nest_var.get(),
+                    comment_var.get(),
+                    expires_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            def update_capacity(*_):
+                if cover_var.get():
+                    cap = CapacityCalculator.image_lsb_capacity(cover_var.get())
+                    capacity_var.set(f"Capacity: {CapacityCalculator.format_bytes(cap)}")
+                else:
+                    capacity_var.set("Capacity: ")
+
+            def update_strength(*_):
+                _, label = PasswordValidator.check_strength(pwd_var.get())
+                strength_var.set(f"Strength: {label}")
+
+            cover_var.trace_add("write", update_capacity)
+            pwd_var.trace_add("write", update_strength)
+
+            decode = ttk.Labelframe(container, text="Decode Image")
+            decode.pack(fill=tk.X)
+
+            stego_var = tk.StringVar()
+            dec_pwd_var = tk.StringVar()
+            dec_out_var = tk.StringVar()
+            dec_method_var = tk.StringVar(value="lsb")
+            dec_prng_var = tk.StringVar()
+
+            self._file_row(
+                decode,
+                "Stego image",
+                stego_var,
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")],
+                on_change=self._update_image_preview,
+            )
+
+            dec_method_row = ttk.Frame(decode)
+            dec_method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(dec_method_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(
+                dec_method_row,
+                textvariable=dec_method_var,
+                state="readonly",
+                values=["lsb", "lsb-prng", "lsb-match-prng"],
+                width=18,
+            ).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(dec_method_row, textvariable=dec_prng_var, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(decode, textvariable=dec_pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            self._save_row(decode, "Output file (optional)", dec_out_var, def_ext=".txt", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract Data",
+                command=lambda: self._decode_image(
+                    stego_var.get(),
+                    dec_pwd_var.get(),
+                    dec_out_var.get(),
+                    dec_method_var.get(),
+                    dec_prng_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_audio_tab(self, parent: ttk.Frame) -> None:
+            audio_patterns = " ".join([f"*{ext}" for ext in AUDIO_EXT_LIST])
+            filetypes = [("Audio files", audio_patterns), ("All Files", "*.*")]
+            self._build_media_tab(parent, media_type="audio", label="Audio", filetypes=filetypes, def_ext=".mp3",
+                                  preview_func=self._update_audio_preview)
+
+        def _build_video_tab(self, parent: ttk.Frame) -> None:
+            video_patterns = " ".join([f"*{ext}" for ext in VIDEO_EXT_LIST])
+            filetypes = [("Video files", video_patterns), ("All Files", "*.*")]
+            self._build_media_tab(parent, media_type="video", label="Video", filetypes=filetypes, def_ext=".mp4",
+                                  preview_func=self._update_video_preview)
+
+        def _build_video_frames_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            encode = ttk.Labelframe(container, text="Encode Video Frame")
+            encode.pack(fill=tk.X, pady=(0, 12))
+
+            video_var = tk.StringVar()
+            frame_var = tk.IntVar(value=0)
+            msg_var = tk.StringVar()
+            payload_file_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_var = tk.StringVar()
+            method_var = tk.StringVar(value="lsb")
+            prng_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+            comment_var = tk.StringVar()
+            expires_var = tk.StringVar()
+
+            video_patterns = " ".join([f"*{ext}" for ext in VIDEO_EXT_LIST])
+            video_filetypes = [("Video files", video_patterns), ("All Files", "*.*")]
+            self._file_row(encode, "Video file", video_var, filetypes=video_filetypes, on_change=self._update_video_preview)
+            frame_row = ttk.Frame(encode)
+            frame_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(frame_row, text="Frame index").pack(side=tk.LEFT)
+            ttk.Spinbox(frame_row, from_=0, to=1_000_000, textvariable=frame_var, width=8).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=msg_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
+
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            method_row = ttk.Frame(encode)
+            method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(method_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(method_row, textvariable=method_var, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(method_row, textvariable=prng_var, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Checkbutton(encode, text="Compress payload", variable=compress_var).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            self._save_row(encode, "Output video", out_var, def_ext=".mp4", filetypes=video_filetypes)
+
+            ttk.Button(
+                encode,
+                text="Embed in Frame",
+                command=lambda: self._encode_video_frame(
+                    video_var.get(),
+                    frame_var.get(),
+                    msg_var.get(),
+                    payload_file_var.get(),
+                    pwd_var.get(),
+                    out_var.get(),
+                    method_var.get(),
+                    prng_var.get(),
+                    compress_var.get(),
+                    comment_var.get(),
+                    expires_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            decode = ttk.Labelframe(container, text="Decode Video Frame")
+            decode.pack(fill=tk.X)
+
+            dec_video = tk.StringVar()
+            dec_frame = tk.IntVar(value=0)
+            dec_pwd = tk.StringVar()
+            dec_out = tk.StringVar()
+            dec_method = tk.StringVar(value="lsb")
+            dec_prng = tk.StringVar()
+
+            self._file_row(decode, "Video file", dec_video, filetypes=video_filetypes, on_change=self._update_video_preview)
+            dec_row = ttk.Frame(decode)
+            dec_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(dec_row, text="Frame index").pack(side=tk.LEFT)
+            ttk.Spinbox(dec_row, from_=0, to=1_000_000, textvariable=dec_frame, width=8).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_row, text="Method").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Combobox(dec_row, textvariable=dec_method, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(dec_row, textvariable=dec_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(decode, textvariable=dec_pwd, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(decode, "Output file", dec_out, def_ext=".bin", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract from Frame",
+                command=lambda: self._decode_video_frame(
+                    dec_video.get(),
+                    dec_frame.get(),
+                    dec_pwd.get(),
+                    dec_out.get(),
+                    dec_method.get(),
+                    dec_prng.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_gif_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            encode = ttk.Labelframe(container, text="Encode GIF")
+            encode.pack(fill=tk.X, pady=(0, 12))
+
+            gif_var = tk.StringVar()
+            frame_var = tk.IntVar(value=0)
+            msg_var = tk.StringVar()
+            payload_file_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_var = tk.StringVar()
+            method_var = tk.StringVar(value="lsb")
+            prng_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+            comment_var = tk.StringVar()
+            expires_var = tk.StringVar()
+
+            self._file_row(encode, "GIF file", gif_var, filetypes=[("GIF", "*.gif")])
+            frame_row = ttk.Frame(encode)
+            frame_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(frame_row, text="Frame index").pack(side=tk.LEFT)
+            ttk.Spinbox(frame_row, from_=0, to=10_000, textvariable=frame_var, width=8).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=msg_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
+
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            method_row = ttk.Frame(encode)
+            method_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(method_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(method_row, textvariable=method_var, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(method_row, textvariable=prng_var, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Checkbutton(encode, text="Compress payload", variable=compress_var).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            self._save_row(encode, "Output GIF", out_var, def_ext=".gif", filetypes=[("GIF", "*.gif")])
+
+            ttk.Button(
+                encode,
+                text="Embed in Frame",
+                command=lambda: self._encode_gif(
+                    gif_var.get(),
+                    frame_var.get(),
+                    msg_var.get(),
+                    payload_file_var.get(),
+                    pwd_var.get(),
+                    out_var.get(),
+                    method_var.get(),
+                    prng_var.get(),
+                    compress_var.get(),
+                    comment_var.get(),
+                    expires_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            decode = ttk.Labelframe(container, text="Decode GIF")
+            decode.pack(fill=tk.X)
+
+            dec_gif = tk.StringVar()
+            dec_frame = tk.IntVar(value=0)
+            dec_pwd = tk.StringVar()
+            dec_out = tk.StringVar()
+            dec_method = tk.StringVar(value="lsb")
+            dec_prng = tk.StringVar()
+
+            self._file_row(decode, "GIF file", dec_gif, filetypes=[("GIF", "*.gif")])
+            dec_row = ttk.Frame(decode)
+            dec_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(dec_row, text="Frame index").pack(side=tk.LEFT)
+            ttk.Spinbox(dec_row, from_=0, to=10_000, textvariable=dec_frame, width=8).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_row, text="Method").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Combobox(dec_row, textvariable=dec_method, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(dec_row, textvariable=dec_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(decode, textvariable=dec_pwd, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(decode, "Output file", dec_out, def_ext=".bin", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract from Frame",
+                command=lambda: self._decode_gif(
+                    dec_gif.get(),
+                    dec_frame.get(),
+                    dec_pwd.get(),
+                    dec_out.get(),
+                    dec_method.get(),
+                    dec_prng.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_pdf_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            encode = ttk.Labelframe(container, text="Encode PDF")
+            encode.pack(fill=tk.X, pady=(0, 12))
+
+            pdf_var = tk.StringVar()
+            msg_var = tk.StringVar()
+            payload_file_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+            comment_var = tk.StringVar()
+            expires_var = tk.StringVar()
+
+            self._file_row(encode, "PDF file", pdf_var, filetypes=[("PDF", "*.pdf")], on_change=self._update_pdf_preview)
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=msg_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Checkbutton(encode, text="Compress payload", variable=compress_var).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(encode, "Output PDF", out_var, def_ext=".pdf", filetypes=[("PDF", "*.pdf")])
+
+            ttk.Button(
+                encode,
+                text="Embed in PDF",
+                command=lambda: self._encode_pdf(
+                    pdf_var.get(),
+                    msg_var.get(),
+                    payload_file_var.get(),
+                    pwd_var.get(),
+                    out_var.get(),
+                    compress_var.get(),
+                    comment_var.get(),
+                    expires_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            decode = ttk.Labelframe(container, text="Decode PDF")
+            decode.pack(fill=tk.X)
+
+            dec_pdf = tk.StringVar()
+            dec_pwd = tk.StringVar()
+            dec_out = tk.StringVar()
+            self._file_row(decode, "PDF file", dec_pdf, filetypes=[("PDF", "*.pdf")], on_change=self._update_pdf_preview)
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(decode, textvariable=dec_pwd, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(decode, "Output file (optional)", dec_out, def_ext=".bin", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract from PDF",
+                command=lambda: self._decode_pdf(dec_pdf.get(), dec_pwd.get(), dec_out.get()),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_media_tab(self, parent: ttk.Frame, media_type: str, label: str,
+                     filetypes: list[tuple[str, str]], def_ext: str,
+                     preview_func: Callable[[str], None] | None = None) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            encode = ttk.Labelframe(container, text=f"Encode {label}")
+            encode.pack(fill=tk.X, pady=(0, 12))
+
+            input_var = tk.StringVar()
+            msg_var = tk.StringVar()
+            payload_file_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+            comment_var = tk.StringVar()
+            expires_var = tk.StringVar()
+
+            self._file_row(encode, f"{label} file", input_var, filetypes=filetypes, on_change=preview_func)
+            ttk.Label(encode, text="Message").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=msg_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._file_row(encode, "Payload file (optional)", payload_file_var, filetypes=[("All Files", "*.*")])
+            ttk.Label(encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Checkbutton(encode, text="Compress payload", variable=compress_var).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(encode, text="Comment (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=comment_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(encode, text="Expires (YYYY-MM-DD or ISO datetime)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(encode, textvariable=expires_var).pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(encode, "Output file", out_var, def_ext=def_ext, filetypes=filetypes)
+
+            ttk.Button(
+                encode,
+                text="Embed Data",
+                command=lambda: self._encode_media(
+                    media_type,
+                    input_var.get(),
+                    msg_var.get(),
+                    payload_file_var.get(),
+                    pwd_var.get(),
+                    out_var.get(),
+                    compress_var.get(),
+                    comment_var.get(),
+                    expires_var.get(),
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            decode = ttk.Labelframe(container, text=f"Decode {label}")
+            decode.pack(fill=tk.X)
+
+            stego_var = tk.StringVar()
+            dec_pwd_var = tk.StringVar()
+            dec_out_var = tk.StringVar()
+            self._file_row(decode, f"{label} file", stego_var, filetypes=filetypes, on_change=preview_func)
+            ttk.Label(decode, text="Password (if needed)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(decode, textvariable=dec_pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._save_row(decode, "Output file", dec_out_var, def_ext=".bin", filetypes=[("All Files", "*.*")])
+
+            ttk.Button(
+                decode,
+                text="Extract Data",
+                command=lambda: self._decode_media(media_type, stego_var.get(), dec_pwd_var.get(), dec_out_var.get()),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_tools_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            help_box = ttk.Labelframe(container, text="Help")
+            help_box.pack(fill=tk.X, pady=(0, 12))
+            info = (
+                "Use PNG for image steganography, select strong passwords, and test extraction before sharing files. "
+                "PRNG methods require a key. Compression can increase capacity at the cost of predictability."
+            )
+            ttk.Label(help_box, text=info, wraplength=900, justify=tk.LEFT).pack(padx=10, pady=8)
+
+            cap_box = ttk.Labelframe(container, text="Capacity Calculator")
+            cap_box.pack(fill=tk.X)
+
+            img_var = tk.StringVar()
+            cap_var = tk.StringVar(value="Capacity: ")
+            self._file_row(cap_box, "Image file", img_var, filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+            ttk.Label(cap_box, textvariable=cap_var).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+            def update_cap(*_):
+                if img_var.get():
+                    cap = CapacityCalculator.image_lsb_capacity(img_var.get())
+                    cap_var.set(f"Capacity: {CapacityCalculator.format_bytes(cap)}")
+                else:
+                    cap_var.set("Capacity: ")
+
+            img_var.trace_add("write", update_cap)
+
+            vault_box = ttk.Labelframe(container, text="Key Vault")
+            vault_box.pack(fill=tk.X, pady=(12, 0))
+
+            key_name = tk.StringVar()
+            key_value = tk.StringVar()
+            master_pwd = tk.StringVar()
+
+            ttk.Label(vault_box, text="Key name").pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ttk.Entry(vault_box, textvariable=key_name).pack(fill=tk.X, padx=10)
+            ttk.Label(vault_box, text="Key value").pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ttk.Entry(vault_box, textvariable=key_value).pack(fill=tk.X, padx=10)
+            ttk.Label(vault_box, text="Master password").pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ttk.Entry(vault_box, textvariable=master_pwd, show="*").pack(fill=tk.X, padx=10)
+
+            vault_btns = ttk.Frame(vault_box)
+            vault_btns.pack(fill=tk.X, padx=10, pady=8)
+
+            def save_key():
+                if not key_name.get() or not key_value.get() or not master_pwd.get():
+                    messagebox.showerror("Error", "Provide key name, key value, and master password.")
+                    return
+                try:
+                    keys = self._load_vault(master_pwd.get())
+                except Exception:
+                    keys = {}
+                keys[key_name.get()] = key_value.get()
+                self._save_vault(master_pwd.get(), keys)
+                messagebox.showinfo("Success", "Key saved.")
+
+            def load_key():
+                if not key_name.get() or not master_pwd.get():
+                    messagebox.showerror("Error", "Provide key name and master password.")
+                    return
+                keys = self._load_vault(master_pwd.get())
+                if key_name.get() not in keys:
+                    messagebox.showerror("Error", "Key not found in vault.")
+                    return
+                value = keys[key_name.get()]
+                key_value.set(value)
+                self._copy_to_clipboard(value)
+                messagebox.showinfo("Success", "Key loaded and copied to clipboard.")
+
+            ttk.Button(vault_btns, text="Save Key", command=save_key).pack(side=tk.LEFT)
+            ttk.Button(vault_btns, text="Load Key", command=load_key).pack(side=tk.LEFT, padx=6)
+
+            templates_box = ttk.Labelframe(container, text="Templates")
+            templates_box.pack(fill=tk.X, pady=(12, 0))
+
+            template_name = tk.StringVar()
+            ttk.Label(templates_box, text="Template name").pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ttk.Entry(templates_box, textvariable=template_name).pack(fill=tk.X, padx=10)
+
+            tmpl_btns = ttk.Frame(templates_box)
+            tmpl_btns.pack(fill=tk.X, padx=10, pady=8)
+
+            def save_template():
+                if not template_name.get():
+                    messagebox.showerror("Error", "Provide a template name.")
+                    return
+                templates = self._load_templates()
+                if not hasattr(self, "image_vars"):
+                    messagebox.showerror("Error", "Image tab is not initialized.")
+                    return
+                templates[template_name.get()] = {
+                    "method": self.image_vars["method"].get(),
+                    "prng_key": self.image_vars["prng_key"].get(),
+                    "compress": str(self.image_vars["compress"].get()),
+                    "auto_convert": str(self.image_vars["auto_convert"].get()),
+                    "watermark": self.image_vars["watermark"].get(),
+                    "nest_levels": str(self.image_vars["nest_levels"].get()),
+                }
+                self._save_templates(templates)
+                messagebox.showinfo("Success", "Template saved.")
+
+            def load_template():
+                if not template_name.get():
+                    messagebox.showerror("Error", "Provide a template name.")
+                    return
+                templates = self._load_templates()
+                if template_name.get() not in templates:
+                    messagebox.showerror("Error", "Template not found.")
+                    return
+                if not hasattr(self, "image_vars"):
+                    messagebox.showerror("Error", "Image tab is not initialized.")
+                    return
+                values = templates[template_name.get()]
+                self.image_vars["method"].set(values.get("method", "lsb"))
+                self.image_vars["prng_key"].set(values.get("prng_key", ""))
+                self.image_vars["compress"].set(values.get("compress", "False") == "True")
+                self.image_vars["auto_convert"].set(values.get("auto_convert", "True") == "True")
+                self.image_vars["watermark"].set(values.get("watermark", ""))
+                try:
+                    self.image_vars["nest_levels"].set(int(values.get("nest_levels", "1")))
+                except ValueError:
+                    self.image_vars["nest_levels"].set(1)
+                messagebox.showinfo("Success", "Template loaded into Image tab.")
+
+            ttk.Button(tmpl_btns, text="Save Template", command=save_template).pack(side=tk.LEFT)
+            ttk.Button(tmpl_btns, text="Load Template", command=load_template).pack(side=tk.LEFT, padx=6)
+
+            qr_box = ttk.Labelframe(container, text="QR Code Generator")
+            qr_box.pack(fill=tk.X, pady=(12, 0))
+            qr_text = tk.StringVar()
+            qr_out = tk.StringVar()
+            ttk.Label(qr_box, text="Text").pack(anchor=tk.W, padx=10, pady=(6, 0))
+            ttk.Entry(qr_box, textvariable=qr_text).pack(fill=tk.X, padx=10)
+            self._save_row(qr_box, "Output PNG", qr_out, def_ext=".png", filetypes=[("PNG", "*.png")])
+
+            ttk.Button(
+                qr_box,
+                text="Generate QR",
+                command=lambda: self._run_command(
+                    ["python", str(Path(__file__).parent / "app.py"), "qr-generate",
+                     "--text", qr_text.get(), "--out", qr_out.get()],
+                    "QR generate",
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            portable_box = ttk.Labelframe(container, text="Portable Decoder")
+            portable_box.pack(fill=tk.X, pady=(12, 0))
+            port_in = tk.StringVar()
+            port_out = tk.StringVar()
+            port_method = tk.StringVar(value="lsb")
+            port_prng = tk.StringVar()
+            port_pwd = tk.StringVar()
+            port_frame = tk.StringVar()
+
+            self._file_row(portable_box, "Stego file", port_in, filetypes=[("All Files", "*.*")])
+            self._save_row(portable_box, "Output ZIP", port_out, def_ext=".zip", filetypes=[("ZIP", "*.zip")])
+            port_row = ttk.Frame(portable_box)
+            port_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(port_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(port_row, textvariable=port_method, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(port_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(port_row, textvariable=port_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Label(portable_box, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(portable_box, textvariable=port_pwd, show="*").pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(portable_box, text="Frame index (GIF/Video frames)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(portable_box, textvariable=port_frame).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            def run_portable():
+                cmd = ["python", str(Path(__file__).parent / "app.py"), "portable-decoder",
+                       "--input", port_in.get(), "--out", port_out.get()]
+                if port_method.get():
+                    cmd.extend(["--method", port_method.get()])
+                if port_prng.get():
+                    cmd.extend(["--prng-key", port_prng.get()])
+                if port_pwd.get():
+                    cmd.extend(["--password", port_pwd.get()])
+                if port_frame.get():
+                    cmd.extend(["--frame", port_frame.get()])
+                self._run_command(cmd, "Portable decoder")
+
+            ttk.Button(portable_box, text="Create Decoder", command=run_portable).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            assoc_box = ttk.Labelframe(container, text="File Association (Windows)")
+            assoc_box.pack(fill=tk.X, pady=(12, 0))
+            assoc_out = tk.StringVar()
+            self._save_row(assoc_box, "Output .reg", assoc_out, def_ext=".reg", filetypes=[("Registry", "*.reg")])
+            ttk.Button(
+                assoc_box,
+                text="Generate .reg",
+                command=lambda: self._run_command(
+                    ["python", str(Path(__file__).parent / "app.py"), "file-assoc", "--out", assoc_out.get()],
+                    "File association",
+                ),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            meta_box = ttk.Labelframe(container, text="Metadata Viewer")
+            meta_box.pack(fill=tk.X, pady=(12, 0))
+            meta_file = tk.StringVar()
+            self._file_row(meta_box, "File", meta_file, filetypes=[("All Files", "*.*")])
+            meta_text = tk.StringVar(value="")
+
+            def view_meta():
+                path = meta_file.get()
+                if not path:
+                    messagebox.showerror("Error", "Select a file.")
+                    return
+                info = []
+                try:
+                    size = Path(path).stat().st_size
+                    info.append(f"Size: {CapacityCalculator.format_bytes(size)}")
+                except Exception:
+                    pass
+                ext = Path(path).suffix.lower()
+                try:
+                    if ext in (".png", ".jpg", ".jpeg", ".gif"):
+                        img = Image.open(path)
+                        info.append(f"Image: {img.size[0]}x{img.size[1]}")
+                        if ext == ".gif":
+                            info.append(f"Frames: {sum(1 for _ in ImageSequence.Iterator(img))}")
+                    elif ext == ".mp3":
+                        tags = ID3(path)
+                        info.append(f"MP3 tags: {len(tags.keys())}")
+                    elif ext == ".mp4":
+                        tags = MP4(path)
+                        info.append(f"MP4 tags: {len(tags.keys())}")
+                    elif ext == ".pdf":
+                        reader = PdfReader(path)
+                        info.append(f"Pages: {len(reader.pages)}")
+                except Exception as exc:
+                    info.append(f"Metadata error: {exc}")
+                meta_text.set(" | ".join(info))
+
+            ttk.Button(meta_box, text="View Metadata", command=view_meta).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(meta_box, textvariable=meta_text).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+            hash_box = ttk.Labelframe(container, text="Data Integrity Check (SHA256)")
+            hash_box.pack(fill=tk.X, pady=(12, 0))
+            hash_file = tk.StringVar()
+            hash_result = tk.StringVar(value="")
+            self._file_row(hash_box, "File", hash_file, filetypes=[("All Files", "*.*")])
+
+            def calc_hash():
+                path = hash_file.get()
+                if not path:
+                    messagebox.showerror("Error", "Select a file.")
+                    return
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        h.update(chunk)
+                hash_result.set(h.hexdigest())
+
+            ttk.Button(hash_box, text="Compute Hash", command=calc_hash).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Entry(hash_box, textvariable=hash_result).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            browser_box = ttk.Labelframe(container, text="File Browser")
+            browser_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+            dir_var = tk.StringVar(value=str(Path.home()))
+
+            dir_row = ttk.Frame(browser_box)
+            dir_row.pack(fill=tk.X, padx=10, pady=(6, 6))
+            ttk.Label(dir_row, text="Folder").pack(side=tk.LEFT)
+            ttk.Entry(dir_row, textvariable=dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            ttk.Button(dir_row, text="Browse", command=lambda: dir_var.set(filedialog.askdirectory())).pack(side=tk.LEFT)
+
+            file_list = tk.Listbox(browser_box, height=6)
+            file_list.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+
+            def refresh_list(*_):
+                file_list.delete(0, tk.END)
+                try:
+                    for name in sorted(os.listdir(dir_var.get())):
+                        file_list.insert(tk.END, name)
+                except Exception as exc:
+                    file_list.insert(tk.END, f"Error: {exc}")
+
+            dir_var.trace_add("write", refresh_list)
+            refresh_list()
+
+            gallery_box = ttk.Labelframe(container, text="Gallery Builder")
+            gallery_box.pack(fill=tk.X, pady=(12, 0))
+
+            gallery_files: list[str] = []
+            gallery_list = tk.Listbox(gallery_box, height=5)
+            gallery_list.pack(fill=tk.X, padx=10, pady=6)
+
+            def add_gallery_files():
+                paths = filedialog.askopenfilenames(filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+                for p in paths:
+                    if p not in gallery_files:
+                        gallery_files.append(p)
+                        gallery_list.insert(tk.END, p)
+
+            def remove_gallery_files():
+                sel = gallery_list.curselection()
+                for idx in reversed(sel):
+                    gallery_files.pop(idx)
+                    gallery_list.delete(idx)
+
+            gallery_btns = ttk.Frame(gallery_box)
+            gallery_btns.pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Button(gallery_btns, text="Add Images", command=add_gallery_files).pack(side=tk.LEFT)
+            ttk.Button(gallery_btns, text="Remove Selected", command=remove_gallery_files).pack(side=tk.LEFT, padx=6)
+
+            gallery_out = tk.StringVar()
+            self._save_row(gallery_box, "Output ZIP", gallery_out, def_ext=".zip", filetypes=[("ZIP", "*.zip")])
+
+            def build_gallery():
+                if not gallery_files:
+                    messagebox.showerror("Error", "Add at least one image.")
+                    return
+                if not gallery_out.get():
+                    messagebox.showerror("Error", "Select an output zip.")
+                    return
+                with zipfile.ZipFile(gallery_out.get(), "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p in gallery_files:
+                        zf.write(p, arcname=Path(p).name)
+                messagebox.showinfo("Success", "Gallery zip created. Embed it as a payload file.")
+
+            ttk.Button(gallery_box, text="Create Gallery ZIP", command=build_gallery).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_batch_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            batch_encode = ttk.Labelframe(container, text="Batch Encode Images")
+            batch_encode.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+
+            files_var = []
+            listbox = tk.Listbox(batch_encode, height=6)
+            listbox.pack(fill=tk.X, padx=10, pady=6)
+
+            def add_files():
+                paths = filedialog.askopenfilenames(filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+                for p in paths:
+                    if p not in files_var:
+                        files_var.append(p)
+                        listbox.insert(tk.END, p)
+
+            def remove_selected():
+                sel = listbox.curselection()
+                for idx in reversed(sel):
+                    files_var.pop(idx)
+                    listbox.delete(idx)
+
+            btn_row = ttk.Frame(batch_encode)
+            btn_row.pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Button(btn_row, text="Add Files", command=add_files).pack(side=tk.LEFT)
+            ttk.Button(btn_row, text="Remove Selected", command=remove_selected).pack(side=tk.LEFT, padx=6)
+
+            msg_var = tk.StringVar()
+            pwd_var = tk.StringVar()
+            out_dir_var = tk.StringVar()
+            method_var = tk.StringVar(value="lsb")
+            prng_var = tk.StringVar()
+            compress_var = tk.BooleanVar(value=False)
+
+            ttk.Label(batch_encode, text="Message").pack(anchor=tk.W, padx=10)
+            ttk.Entry(batch_encode, textvariable=msg_var).pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(batch_encode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(batch_encode, textvariable=pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 6))
+
+            method_row = ttk.Frame(batch_encode)
+            method_row.pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(method_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(method_row, textvariable=method_var, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(method_row, textvariable=prng_var, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Checkbutton(batch_encode, text="Compress payload", variable=compress_var).pack(anchor=tk.W, padx=10)
+
+            out_row = ttk.Frame(batch_encode)
+            out_row.pack(fill=tk.X, padx=10, pady=(6, 8))
+            ttk.Label(out_row, text="Output folder").pack(side=tk.LEFT)
+            ttk.Entry(out_row, textvariable=out_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            ttk.Button(out_row, text="Browse", command=lambda: out_dir_var.set(filedialog.askdirectory())).pack(side=tk.LEFT)
+
+            ttk.Button(
+                batch_encode,
+                text="Run Batch Encode",
+                command=lambda: self._batch_encode_images(files_var, msg_var.get(), pwd_var.get(), out_dir_var.get(),
+                                                          method_var.get(), prng_var.get(), compress_var.get()),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            batch_decode = ttk.Labelframe(container, text="Batch Decode Images")
+            batch_decode.pack(fill=tk.BOTH, expand=True)
+
+            dec_files = []
+            dec_list = tk.Listbox(batch_decode, height=6)
+            dec_list.pack(fill=tk.X, padx=10, pady=6)
+
+            def add_dec_files():
+                paths = filedialog.askopenfilenames(filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+                for p in paths:
+                    if p not in dec_files:
+                        dec_files.append(p)
+                        dec_list.insert(tk.END, p)
+
+            def remove_dec_selected():
+                sel = dec_list.curselection()
+                for idx in reversed(sel):
+                    dec_files.pop(idx)
+                    dec_list.delete(idx)
+
+            dec_btn_row = ttk.Frame(batch_decode)
+            dec_btn_row.pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Button(dec_btn_row, text="Add Files", command=add_dec_files).pack(side=tk.LEFT)
+            ttk.Button(dec_btn_row, text="Remove Selected", command=remove_dec_selected).pack(side=tk.LEFT, padx=6)
+
+            dec_pwd_var = tk.StringVar()
+            dec_out_dir = tk.StringVar()
+            dec_method = tk.StringVar(value="lsb")
+            dec_prng = tk.StringVar()
+
+            ttk.Label(batch_decode, text="Password (optional)").pack(anchor=tk.W, padx=10)
+            ttk.Entry(batch_decode, textvariable=dec_pwd_var, show="*").pack(fill=tk.X, padx=10, pady=(0, 6))
+
+            dec_method_row = ttk.Frame(batch_decode)
+            dec_method_row.pack(fill=tk.X, padx=10, pady=(0, 6))
+            ttk.Label(dec_method_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(dec_method_row, textvariable=dec_method, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(dec_method_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(dec_method_row, textvariable=dec_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            out_dec_row = ttk.Frame(batch_decode)
+            out_dec_row.pack(fill=tk.X, padx=10, pady=(6, 8))
+            ttk.Label(out_dec_row, text="Output folder").pack(side=tk.LEFT)
+            ttk.Entry(out_dec_row, textvariable=dec_out_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            ttk.Button(out_dec_row, text="Browse", command=lambda: dec_out_dir.set(filedialog.askdirectory())).pack(side=tk.LEFT)
+
+            ttk.Button(
+                batch_decode,
+                text="Run Batch Decode",
+                command=lambda: self._batch_decode_images(dec_files, dec_pwd_var.get(), dec_out_dir.get(),
+                                                          dec_method.get(), dec_prng.get()),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+        def _build_analyze_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            compare = ttk.Labelframe(container, text="Image Comparison")
+            compare.pack(fill=tk.X)
+
+            original_var = tk.StringVar()
+            stego_var = tk.StringVar()
+            diff_out = tk.StringVar()
+            result_var = tk.StringVar(value="")
+
+            self._file_row(compare, "Original image", original_var, filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+            self._file_row(compare, "Stego image", stego_var, filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+            self._save_row(compare, "Diff output (optional)", diff_out, def_ext=".png", filetypes=[("PNG", "*.png")])
+
+            ttk.Button(
+                compare,
+                text="Analyze",
+                command=lambda: self._analyze_images(original_var.get(), stego_var.get(), diff_out.get(), result_var),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            ttk.Label(compare, textvariable=result_var).pack(anchor=tk.W, padx=10, pady=(0, 10))
+
+            detect = ttk.Labelframe(container, text="Stego Detection")
+            detect.pack(fill=tk.X, pady=(12, 0))
+
+            detect_image = tk.StringVar()
+            detect_method = tk.StringVar(value="lsb")
+            detect_prng = tk.StringVar()
+            detect_result = tk.StringVar(value="")
+
+            self._file_row(detect, "Image", detect_image, filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+
+            detect_row = ttk.Frame(detect)
+            detect_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(detect_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(
+                detect_row,
+                textvariable=detect_method,
+                state="readonly",
+                values=["lsb", "lsb-prng", "lsb-match-prng"],
+                width=18,
+            ).pack(side=tk.LEFT, padx=8)
+            ttk.Label(detect_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(detect_row, textvariable=detect_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Button(
+                detect,
+                text="Detect",
+                command=lambda: self._detect_image(detect_image.get(), detect_method.get(), detect_prng.get(), detect_result),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+            ttk.Label(detect, textvariable=detect_result).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+            security = ttk.Labelframe(container, text="Security Analysis")
+            security.pack(fill=tk.X, pady=(12, 0))
+
+            sec_image = tk.StringVar()
+            sec_method = tk.StringVar(value="lsb")
+            sec_prng = tk.StringVar()
+            sec_result = tk.StringVar(value="")
+
+            self._file_row(security, "Image", sec_image, filetypes=[("Images", "*.png *.jpg *.jpeg *.gif")])
+            sec_row = ttk.Frame(security)
+            sec_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            ttk.Label(sec_row, text="Method").pack(side=tk.LEFT)
+            ttk.Combobox(sec_row, textvariable=sec_method, state="readonly",
+                         values=["lsb", "lsb-prng", "lsb-match-prng"], width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Label(sec_row, text="PRNG key").pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Entry(sec_row, textvariable=sec_prng, width=28).pack(side=tk.LEFT, padx=8)
+
+            ttk.Button(
+                security,
+                text="Rate Security",
+                command=lambda: self._security_analysis(sec_image.get(), sec_method.get(), sec_prng.get(), sec_result),
+            ).pack(anchor=tk.W, padx=10, pady=(0, 8))
+            ttk.Label(security, textvariable=sec_result).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+        def _update_image_preview(self, path: str) -> None:
+            if not path:
+                self.preview_image.configure(text="No image selected", image="")
+                self._preview_image_ref = None
+                return
+            try:
+                img = Image.open(path)
+                img.thumbnail((260, 200))
+                tk_img = ImageTk.PhotoImage(img)
+                self.preview_image.configure(image=tk_img, text="")
+                self._preview_image_ref = tk_img
+            except Exception:
+                self.preview_image.configure(text="Preview unavailable", image="")
+                self._preview_image_ref = None
+
+        def _update_audio_preview(self, path: str) -> None:
+            if not path:
+                self.preview_audio.configure(text="No audio selected")
+                return
+            try:
+                audio = MutagenFile(path)
+                length = getattr(getattr(audio, "info", None), "length", None) if audio else None
+                bitrate = getattr(getattr(audio, "info", None), "bitrate", None) if audio else None
+                duration = f"{length:.1f}s" if length else "Unknown length"
+                rate = f"{bitrate // 1000} kbps" if bitrate else ""
+                name = Path(path).name
+                info = f"{name}\n{duration} {rate}".strip()
+                self.preview_audio.configure(text=info)
+            except Exception:
+                self.preview_audio.configure(text="Preview unavailable")
+
+        def _update_video_preview(self, path: str) -> None:
+            if not path:
+                self.preview_video.configure(text="No video selected", image="")
+                self._preview_video_ref = None
+                return
+            try:
+                reader = imageio.get_reader(path)
+                frame = reader.get_data(0)
+                reader.close()
+                img = Image.fromarray(frame)
+                img.thumbnail((260, 160))
+                tk_img = ImageTk.PhotoImage(img)
+                self.preview_video.configure(image=tk_img, text="")
+                self._preview_video_ref = tk_img
+            except Exception:
+                self.preview_video.configure(text="Preview unavailable", image="")
+                self._preview_video_ref = None
+
+        def _update_pdf_preview(self, path: str) -> None:
+            if not path:
+                self.preview_pdf.configure(text="No PDF selected")
+                return
+            try:
+                reader = PdfReader(path)
+                pages = len(reader.pages)
+                snippet = ""
+                if pages:
+                    snippet = reader.pages[0].extract_text() or ""
+                    snippet = " ".join(snippet.split())[:280]
+                name = Path(path).name
+                info = f"{name}\nPages: {pages}"
+                if snippet:
+                    info += f"\n{snippet}"
+                self.preview_pdf.configure(text=info)
+            except Exception:
+                self.preview_pdf.configure(text="Preview unavailable")
+
+        def _build_history_tab(self, parent: ttk.Frame) -> None:
+            container = ttk.Frame(parent)
+            container.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+            self.history_view = ttk.Treeview(container, columns=("time", "action", "status", "details"), show="headings")
+            for col, width in [("time", 160), ("action", 160), ("status", 100), ("details", 700)]:
+                self.history_view.heading(col, text=col.title())
+                self.history_view.column(col, width=width, anchor=tk.W)
+            self.history_view.pack(fill=tk.BOTH, expand=True)
+
+            btn_row = ttk.Frame(container)
+            btn_row.pack(fill=tk.X, pady=8)
+            ttk.Button(btn_row, text="Clear History", command=self._clear_history).pack(side=tk.LEFT)
+
+        def _file_row(self, parent: ttk.Frame, label: str, var: tk.StringVar, filetypes=None,
+                      on_change=None) -> None:
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, padx=10, pady=6)
+            ttk.Label(row, text=label).pack(side=tk.LEFT)
+            entry = ttk.Entry(row, textvariable=var)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            ttk.Button(row, text="Browse", command=lambda: self._pick_file(var, filetypes)).pack(side=tk.LEFT)
+
+            if on_change is not None:
+                var.trace_add("write", lambda *_: on_change(var.get()))
+
+            if dnd_available:
+                entry.drop_target_register(DND_FILES)
+                entry.dnd_bind("<<Drop>>", lambda e: self._handle_drop(e, var))
+
+        def _save_row(self, parent: ttk.Frame, label: str, var: tk.StringVar, def_ext: str, filetypes=None) -> None:
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, padx=10, pady=6)
+            ttk.Label(row, text=label).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            ttk.Button(
+                row,
+                text="Save As",
+                command=lambda: self._save_file(var, def_ext, filetypes),
+            ).pack(side=tk.LEFT)
+
+        def _pick_file(self, var: tk.StringVar, filetypes=None) -> None:
+            path = filedialog.askopenfilename(filetypes=filetypes or [("All Files", "*.*")])
+            if path:
+                var.set(path)
+
+        def _save_file(self, var: tk.StringVar, def_ext: str, filetypes=None) -> None:
+            path = filedialog.asksaveasfilename(defaultextension=def_ext, filetypes=filetypes or [("All Files", "*.*")])
+            if path:
+                var.set(path)
+
+        def _handle_drop(self, event, var: tk.StringVar) -> None:
+            files = normalize_dnd_files(event.data, event.widget)
+            if files:
+                var.set(files[0])
+
+        def _paste_clipboard(self) -> str:
+            try:
+                return self.root.clipboard_get()
+            except Exception:
+                return ""
+
+        def _set_status(self, text: str) -> None:
+            self.status.set_status(text)
+
+        def _add_history(self, action: str, status: str, details: str) -> None:
+            item = HistoryItem(time.strftime("%Y-%m-%d %H:%M:%S"), action, status, details)
+            self.history.append(item)
+            self.history_view.insert("", tk.END, values=(item.timestamp, item.action, item.status, item.details))
+
+        def _clear_history(self) -> None:
+            self.history.clear()
+            for row in self.history_view.get_children():
+                self.history_view.delete(row)
+
+        def _vault_path(self) -> Path:
+            return Path.home() / ".steg_keys.json"
+
+        def _load_vault(self, master_password: str) -> dict[str, str]:
+            path = self._vault_path()
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            salt = base64.b64decode(data["salt"])
+            nonce = base64.b64decode(data["nonce"])
+            ciphertext = base64.b64decode(data["ciphertext"])
+            key = derive_key(master_password, salt)
+            plaintext = AESGCM(key).decrypt(nonce, ciphertext, b"vault")
+            return json.loads(plaintext.decode("utf-8"))
+
+        def _save_vault(self, master_password: str, payload: dict[str, str]) -> None:
+            path = self._vault_path()
+            salt = os.urandom(DEFAULT_SALT_LEN)
+            nonce = os.urandom(DEFAULT_NONCE_LEN)
+            key = derive_key(master_password, salt)
+            plaintext = json.dumps(payload).encode("utf-8")
+            ciphertext = AESGCM(key).encrypt(nonce, plaintext, b"vault")
+            data = {
+                "salt": base64.b64encode(salt).decode("ascii"),
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+            }
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        def _templates_path(self) -> Path:
+            return Path.home() / ".steg_templates.json"
+
+        def _load_templates(self) -> dict[str, dict[str, str]]:
+            path = self._templates_path()
+            if not path.exists():
+                return {}
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        def _save_templates(self, templates: dict[str, dict[str, str]]) -> None:
+            path = self._templates_path()
+            path.write_text(json.dumps(templates, indent=2), encoding="utf-8")
+
+        def _run_command(self, cmd: list[str], action: str, on_success: Optional[Callable[[str], None]] = None) -> None:
+            def task():
+                self.root.after(0, lambda: self._set_status(f"{action} in progress"))
+                self.root.after(0, self.status.start)
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    stdout = result.stdout.strip()
+                    stderr = result.stderr.strip()
+                    if result.returncode == 0:
+                        self.root.after(0, self.status.stop)
+                        self.root.after(0, lambda: self._set_status(f"{action} complete"))
+                        self.root.after(0, lambda: self._add_history(action, "Success", stdout or "OK"))
+                        if on_success:
+                            self.root.after(0, lambda: on_success(stdout))
+                    else:
+                        msg = stderr or stdout or "Operation failed"
+                        self.root.after(0, self.status.stop)
+                        self.root.after(0, lambda: self._set_status(f"{action} failed"))
+                        self.root.after(0, lambda: self._add_history(action, "Failed", msg[:200]))
+                        self.root.after(0, lambda: messagebox.showerror("Error", msg))
+                except Exception as exc:
+                    self.root.after(0, self.status.stop)
+                    self.root.after(0, lambda: self._set_status(f"{action} error"))
+                    self.root.after(0, lambda: self._add_history(action, "Error", str(exc)))
+                    self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+
+            threading.Thread(target=task, daemon=True).start()
+
+        def _encode_image(self, cover: str, message: str, payload_file: str, password: str, output: str,
+                  method: str, prng_key: str, compress: bool, auto_convert: bool,
+                  watermark_text: str, nest_levels: int, comment: str, expires: str) -> None:
+            if not cover:
+                messagebox.showerror("Error", "Select a cover image.")
+                return
+            if not message and not payload_file:
+                messagebox.showerror("Error", "Enter a message or select a payload file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output file.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+            if Path(output).suffix.lower() != ".png":
+                messagebox.showerror("Error", "Output file must be PNG for image encoding.")
+                return
+
+            cover_path = cover
+            temp_path = None
+            if auto_convert and Path(cover).suffix.lower() != ".png":
+                try:
+                    image = Image.open(cover).convert("RGB")
+                    temp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+                    os.close(temp_fd)
+                    image.save(temp_path, format="PNG")
+                    cover_path = temp_path
+                except Exception as exc:
+                    messagebox.showerror("Error", f"Could not convert image: {exc}")
+                    return
+
+            def build_cmd(input_img: str, out_img: str) -> list[str]:
+                cmd = ["python", str(Path(__file__).parent / "app.py"), "encode",
+                       "--image", input_img, "--out", out_img, "--method", method]
+                if payload_file:
+                    cmd.extend(["--in-file", payload_file])
+                else:
+                    cmd.extend(["--message", message])
+                if password:
+                    cmd.extend(["--password", password])
+                if prng_key:
+                    cmd.extend(["--prng-key", prng_key])
+                if compress:
+                    cmd.append("--compress")
+                if comment:
+                    cmd.extend(["--comment", comment])
+                if expires:
+                    cmd.extend(["--expires", expires])
+                return cmd
+
+            if nest_levels < 1:
+                nest_levels = 1
+
+            def run_nested():
+                current_input = cover_path
+                temp_files = []
+                try:
+                    for level in range(1, nest_levels + 1):
+                        if level == nest_levels:
+                            out_path = output
+                        else:
+                            fd, tmp = tempfile.mkstemp(suffix=".png")
+                            os.close(fd)
+                            temp_files.append(tmp)
+                            out_path = tmp
+                        cmd = build_cmd(current_input, out_path)
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                        if result.returncode != 0:
+                            raise RuntimeError(result.stderr or result.stdout or "Nested encode failed")
+                        current_input = out_path
+
+                    if watermark_text:
+                        try:
+                            image = Image.open(output).convert("RGBA")
+                            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+                            draw = ImageDraw.Draw(overlay)
+                            bbox = draw.textbbox((0, 0), watermark_text)
+                            text_width = bbox[2] - bbox[0]
+                            margin = 10
+                            x = max(margin, image.size[0] - text_width - margin)
+                            y = image.size[1] - 24 - margin
+                            draw.text((x, y), watermark_text, fill=(255, 255, 255, 96))
+                            combined = Image.alpha_composite(image, overlay).convert("RGB")
+                            combined.save(output)
+                        except Exception:
+                            pass
+
+                    if temp_path:
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                    for tmp in temp_files:
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+
+                    self.root.after(0, self.status.stop)
+                    self.root.after(0, lambda: self._set_status("Image encode complete"))
+                    self.root.after(0, lambda: self._add_history("Image encode", "Success", f"Nested levels: {nest_levels}"))
+                except Exception as exc:
+                    self.root.after(0, self.status.stop)
+                    self.root.after(0, lambda: self._set_status("Image encode failed"))
+                    self.root.after(0, lambda: self._add_history("Image encode", "Failed", str(exc)))
+                    self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+
+            self.root.after(0, lambda: self._set_status("Image encode in progress"))
+            self.root.after(0, self.status.start)
+            threading.Thread(target=run_nested, daemon=True).start()
+
+        def _decode_image(self, stego: str, password: str, output: str, method: str, prng_key: str) -> None:
+            if not stego:
+                messagebox.showerror("Error", "Select a stego image.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "decode",
+                   "--image", stego, "--method", method]
+            if password:
+                cmd.extend(["--password", password])
+            if prng_key:
+                cmd.extend(["--prng-key", prng_key])
+            if output:
+                cmd.extend(["--out", output])
+
+            def on_success(stdout: str):
+                if output:
+                    messagebox.showinfo("Success", f"Decoded output saved to {output}")
+                    return
+                self._show_text_output(stdout or "(No text output)")
+
+            self._run_command(cmd, "Image decode", on_success)
+
+        def _encode_media(self, media_type: str, input_path: str, message: str, payload_file: str,
+                  password: str, output: str, compress: bool, comment: str, expires: str) -> None:
+            if not input_path:
+                messagebox.showerror("Error", f"Select a {media_type.upper()} file.")
+                return
+            if not message and not payload_file:
+                messagebox.showerror("Error", "Enter a message or select a payload file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output file.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), f"{media_type}-encode",
+                   f"--{media_type}", input_path, "--out", output]
+            if payload_file:
+                cmd.extend(["--in-file", payload_file])
+            else:
+                cmd.extend(["--message", message])
+            if password:
+                cmd.extend(["--password", password])
+            if compress:
+                cmd.append("--compress")
+            if comment:
+                cmd.extend(["--comment", comment])
+            if expires:
+                cmd.extend(["--expires", expires])
+
+            self._run_command(cmd, f"{media_type.upper()} encode")
+
+        def _decode_media(self, media_type: str, input_path: str, password: str, output: str) -> None:
+            if not input_path:
+                messagebox.showerror("Error", f"Select a {media_type.upper()} file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output file.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), f"{media_type}-decode",
+                   f"--{media_type}", input_path, "--out", output]
+            if password:
+                cmd.extend(["--password", password])
+
+            self._run_command(cmd, f"{media_type.upper()} decode")
+
+        def _encode_pdf(self, pdf_path: str, message: str, payload_file: str, password: str,
+                        output: str, compress: bool, comment: str, expires: str) -> None:
+            if not pdf_path:
+                messagebox.showerror("Error", "Select a PDF file.")
+                return
+            if not message and not payload_file:
+                messagebox.showerror("Error", "Enter a message or select a payload file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output PDF.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "pdf-encode",
+                   "--pdf", pdf_path, "--out", output]
+            if payload_file:
+                cmd.extend(["--in-file", payload_file])
+            else:
+                cmd.extend(["--message", message])
+            if password:
+                cmd.extend(["--password", password])
+            if compress:
+                cmd.append("--compress")
+            if comment:
+                cmd.extend(["--comment", comment])
+            if expires:
+                cmd.extend(["--expires", expires])
+
+            self._run_command(cmd, "PDF encode")
+
+        def _decode_pdf(self, pdf_path: str, password: str, output: str) -> None:
+            if not pdf_path:
+                messagebox.showerror("Error", "Select a PDF file.")
+                return
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "pdf-decode", "--pdf", pdf_path]
+            if output:
+                cmd.extend(["--out", output])
+            if password:
+                cmd.extend(["--password", password])
+
+            def on_success(stdout: str):
+                if output:
+                    messagebox.showinfo("Success", f"Decoded output saved to {output}")
+                else:
+                    self._show_text_output(stdout or "(No text output)")
+
+            self._run_command(cmd, "PDF decode", on_success)
+
+        def _encode_gif(self, gif_path: str, frame_index: int, message: str, payload_file: str,
+                        password: str, output: str, method: str, prng_key: str,
+                        compress: bool, comment: str, expires: str) -> None:
+            if not gif_path:
+                messagebox.showerror("Error", "Select a GIF file.")
+                return
+            if not message and not payload_file:
+                messagebox.showerror("Error", "Enter a message or select a payload file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output GIF.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "gif-encode",
+                   "--gif", gif_path, "--out", output, "--frame", str(frame_index), "--method", method]
+            if payload_file:
+                cmd.extend(["--in-file", payload_file])
+            else:
+                cmd.extend(["--message", message])
+            if password:
+                cmd.extend(["--password", password])
+            if prng_key:
+                cmd.extend(["--prng-key", prng_key])
+            if compress:
+                cmd.append("--compress")
+            if comment:
+                cmd.extend(["--comment", comment])
+            if expires:
+                cmd.extend(["--expires", expires])
+
+            self._run_command(cmd, "GIF encode")
+
+        def _decode_gif(self, gif_path: str, frame_index: int, password: str, output: str,
+                        method: str, prng_key: str) -> None:
+            if not gif_path:
+                messagebox.showerror("Error", "Select a GIF file.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "gif-decode",
+                   "--gif", gif_path, "--frame", str(frame_index), "--method", method]
+            if output:
+                cmd.extend(["--out", output])
+            if password:
+                cmd.extend(["--password", password])
+            if prng_key:
+                cmd.extend(["--prng-key", prng_key])
+
+            def on_success(stdout: str):
+                if output:
+                    messagebox.showinfo("Success", f"Decoded output saved to {output}")
+                else:
+                    self._show_text_output(stdout or "(No text output)")
+
+            self._run_command(cmd, "GIF decode", on_success)
+
+        def _encode_video_frame(self, video_path: str, frame_index: int, message: str, payload_file: str,
+                                password: str, output: str, method: str, prng_key: str,
+                                compress: bool, comment: str, expires: str) -> None:
+            if not video_path:
+                messagebox.showerror("Error", "Select a video file.")
+                return
+            if not message and not payload_file:
+                messagebox.showerror("Error", "Enter a message or select a payload file.")
+                return
+            if not output:
+                messagebox.showerror("Error", "Select an output video.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "video-frame-encode",
+                   "--video", video_path, "--out", output, "--frame", str(frame_index), "--method", method]
+            if payload_file:
+                cmd.extend(["--in-file", payload_file])
+            else:
+                cmd.extend(["--message", message])
+            if password:
+                cmd.extend(["--password", password])
+            if prng_key:
+                cmd.extend(["--prng-key", prng_key])
+            if compress:
+                cmd.append("--compress")
+            if comment:
+                cmd.extend(["--comment", comment])
+            if expires:
+                cmd.extend(["--expires", expires])
+
+            self._run_command(cmd, "Video frame encode")
+
+        def _decode_video_frame(self, video_path: str, frame_index: int, password: str, output: str,
+                                method: str, prng_key: str) -> None:
+            if not video_path:
+                messagebox.showerror("Error", "Select a video file.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            cmd = ["python", str(Path(__file__).parent / "app.py"), "video-frame-decode",
+                   "--video", video_path, "--frame", str(frame_index), "--method", method]
+            if output:
+                cmd.extend(["--out", output])
+            if password:
+                cmd.extend(["--password", password])
+            if prng_key:
+                cmd.extend(["--prng-key", prng_key])
+
+            def on_success(stdout: str):
+                if output:
+                    messagebox.showinfo("Success", f"Decoded output saved to {output}")
+                else:
+                    self._show_text_output(stdout or "(No text output)")
+
+            self._run_command(cmd, "Video frame decode", on_success)
+
+        def _batch_encode_images(self, files: list[str], message: str, password: str, output_dir: str,
+                                 method: str, prng_key: str, compress: bool) -> None:
+            if not files:
+                messagebox.showerror("Error", "Add at least one image file.")
+                return
+            if not message:
+                messagebox.showerror("Error", "Enter a message to embed.")
+                return
+            if not output_dir:
+                messagebox.showerror("Error", "Select an output folder.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            def task():
+                self.root.after(0, self.status.start)
+                self.root.after(0, lambda: self._set_status("Batch encode in progress"))
+                for idx, path in enumerate(files, start=1):
+                    out_path = Path(output_dir) / f"{Path(path).stem}_stego.png"
+                    cmd = ["python", str(Path(__file__).parent / "app.py"), "encode",
+                           "--image", path, "--out", str(out_path), "--message", message,
+                           "--method", method]
+                    if password:
+                        cmd.extend(["--password", password])
+                    if prng_key:
+                        cmd.extend(["--prng-key", prng_key])
+                    if compress:
+                        cmd.append("--compress")
+
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        self.root.after(0, lambda m=result.stderr: messagebox.showerror("Error", m))
+                        self.root.after(0, self.status.stop)
+                        self.root.after(0, lambda: self._set_status("Batch encode failed"))
+                        return
+                    self.root.after(0, lambda: self._set_status(f"Batch encode {idx}/{len(files)}"))
+
+                self.root.after(0, self.status.stop)
+                self.root.after(0, lambda: self._set_status("Batch encode complete"))
+                self.root.after(0, lambda: self._add_history("Batch encode", "Success", f"{len(files)} files"))
+
+            threading.Thread(target=task, daemon=True).start()
+
+        def _batch_decode_images(self, files: list[str], password: str, output_dir: str,
+                                 method: str, prng_key: str) -> None:
+            if not files:
+                messagebox.showerror("Error", "Add at least one image file.")
+                return
+            if not output_dir:
+                messagebox.showerror("Error", "Select an output folder.")
+                return
+            if method in ("lsb-prng", "lsb-match-prng") and not prng_key:
+                messagebox.showerror("Error", "PRNG key is required for the selected method.")
+                return
+
+            def task():
+                self.root.after(0, self.status.start)
+                self.root.after(0, lambda: self._set_status("Batch decode in progress"))
+                for idx, path in enumerate(files, start=1):
+                    out_path = Path(output_dir) / f"{Path(path).stem}_decoded.bin"
+                    cmd = ["python", str(Path(__file__).parent / "app.py"), "decode",
+                           "--image", path, "--out", str(out_path), "--method", method]
+                    if password:
+                        cmd.extend(["--password", password])
+                    if prng_key:
+                        cmd.extend(["--prng-key", prng_key])
+
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        self.root.after(0, lambda m=result.stderr: messagebox.showerror("Error", m))
+                        self.root.after(0, self.status.stop)
+                        self.root.after(0, lambda: self._set_status("Batch decode failed"))
+                        return
+                    self.root.after(0, lambda: self._set_status(f"Batch decode {idx}/{len(files)}"))
+
+                self.root.after(0, self.status.stop)
+                self.root.after(0, lambda: self._set_status("Batch decode complete"))
+                self.root.after(0, lambda: self._add_history("Batch decode", "Success", f"{len(files)} files"))
+
+            threading.Thread(target=task, daemon=True).start()
+
+        def _analyze_images(self, original: str, stego: str, diff_out: str, result_var: tk.StringVar) -> None:
+            if not original or not stego:
+                messagebox.showerror("Error", "Select both original and stego images.")
+                return
+            try:
+                img_a = Image.open(original).convert("RGB")
+                img_b = Image.open(stego).convert("RGB")
+                if img_a.size != img_b.size:
+                    messagebox.showerror("Error", "Images must be the same size for comparison.")
+                    return
+                diff = ImageChops.difference(img_a, img_b)
+                psnr = compute_psnr(img_a, img_b)
+                if diff_out:
+                    diff.save(diff_out)
+                result = f"PSNR: {psnr:.2f} dB"
+                if diff_out:
+                    result += f" | Diff saved: {diff_out}"
+                result_var.set(result)
+                self._add_history("Analyze", "Success", result)
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc))
+
+        def _detect_image(self, image_path: str, method: str, prng_key: str, result_var: tk.StringVar) -> None:
+            if not image_path:
+                messagebox.showerror("Error", "Select an image.")
+                return
+            try:
+                image = load_image(image_path)
+                channels_len = len(flatten_channels(image))
+                if method == "lsb":
+                    all_bits = extract_bits(image, channels_len)
+                elif method in ("lsb-prng", "lsb-match-prng"):
+                    if not prng_key:
+                        messagebox.showerror("Error", "PRNG key required for PRNG methods.")
+                        return
+                    rng = make_rng(prng_key)
+                    all_bits = extract_bits_prng(image, channels_len, rng)
+                else:
+                    raise ValueError("Unknown method")
+
+                def read_bytes_from_bits(num_bytes: int) -> bytes:
+                    bits = all_bits[: num_bytes * 8]
+                    if len(bits) < num_bytes * 8:
+                        return b""
+                    return bits_to_bytes(bits)
+
+                header_prefix = read_bytes_from_bits(12)
+                if len(header_prefix) < 12:
+                    result_var.set("No stego header detected")
+                    return
+                try:
+                    salt_len = header_prefix[6]
+                    nonce_len = header_prefix[7]
+                    extra_len = salt_len + nonce_len
+                    if extra_len:
+                        extra_bits = all_bits[12 * 8: (12 + extra_len) * 8]
+                        extra_header = bits_to_bytes(extra_bits)
+                    else:
+                        extra_header = b""
+                    header = parse_header(header_prefix + extra_header)
+                except Exception:
+                    result_var.set("No stego header detected")
+                    return
+
+                flags = []
+                if header.flags & FLAG_ENCRYPTED:
+                    flags.append("Encrypted")
+                if header.flags & FLAG_PRNG:
+                    flags.append("PRNG")
+                if header.flags & FLAG_LSB_MATCH:
+                    flags.append("LSB-match")
+                if header.flags & FLAG_COMPRESSED:
+                    flags.append("Compressed")
+                payload = "Image" if (header.flags & FLAG_PAYLOAD_IMAGE) else "Text/File"
+                result = f"Stego detected | Payload: {payload} | Flags: {', '.join(flags) or 'None'}"
+                result_var.set(result)
+                self._add_history("Detect", "Success", result)
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc))
+
+        def _security_analysis(self, image_path: str, method: str, prng_key: str, result_var: tk.StringVar) -> None:
+            if not image_path:
+                messagebox.showerror("Error", "Select an image.")
+                return
+            try:
+                image = load_image(image_path)
+                stego_data = extract_stego_data_from_image(image, method, prng_key)
+                flags, _plaintext, _meta = parse_stego_payload(stego_data, password=None)
+                score = 0
+                if flags & FLAG_ENCRYPTED:
+                    score += 2
+                if flags & FLAG_PRNG:
+                    score += 2
+                if flags & FLAG_LSB_MATCH:
+                    score += 1
+                if flags & FLAG_COMPRESSED:
+                    score += 1
+                rating = "Low"
+                if score >= 4:
+                    rating = "High"
+                elif score >= 2:
+                    rating = "Medium"
+                result = f"Security rating: {rating} (score {score})"
+                result_var.set(result)
+                self._add_history("Security analysis", "Success", result)
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc))
+
+        def _show_text_output(self, text: str) -> None:
+            win = tk.Toplevel(self.root)
+            win.title("Decoded Text")
+            win.geometry("700x400")
+            txt = tk.Text(win, wrap=tk.WORD)
+            txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            txt.insert(tk.END, text)
+            txt.config(state=tk.DISABLED)
+
+            btn_row = ttk.Frame(win)
+            btn_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+            ttk.Button(btn_row, text="Copy to Clipboard", command=lambda: self._copy_to_clipboard(text)).pack(side=tk.LEFT)
+
+        def _copy_to_clipboard(self, text: str) -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+    if dnd_available:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+    SteganographyGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
