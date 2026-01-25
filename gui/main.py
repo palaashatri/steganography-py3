@@ -320,102 +320,96 @@ def gui_main() -> None:
             if sys.platform == "darwin":
                 # On macOS, set the appearance mode
                 try:
-                    # This tells macOS to use dark or light appearance
                     appearance = "darkAqua" if dark else "aqua"
                     self.root.tk.call("::tk::unsupported::MacWindowStyle", "appearance", self.root._w, appearance)
-                    
-                    # Force the window to redraw with new appearance
-                    self.root.update()
                 except Exception:
                     pass
                 
-                # Apply aqua theme (it will adapt to the appearance we just set)
+                # Apply aqua theme
                 if "aqua" in style.theme_names():
                     style.theme_use("aqua")
+                    
             elif sys.platform == "win32":
-                # Apply Windows native theme first
-                for name in ("vista", "xpnative", "winnative"):
-                    if name in style.theme_names():
-                        style.theme_use(name)
-                        break
+                # Windows: Use alt theme for dark mode, default theme for light mode
+                if dark:
+                    # Try to use alt theme which is darker on Windows
+                    if "alt" in style.theme_names():
+                        style.theme_use("alt")
+                    elif "clam" in style.theme_names():
+                        style.theme_use("clam")
+                    
+                    # Apply dark colors
+                    bg_color = "#2b2b2b"
+                    fg_color = "#ffffff"
+                    select_bg = "#0078d7"
+                    
+                    style.configure(".", background=bg_color, foreground=fg_color,
+                                  fieldbackground="#3c3c3c", selectbackground=select_bg,
+                                  selectforeground="#ffffff", bordercolor=bg_color,
+                                  darkcolor=bg_color, lightcolor=bg_color)
+                    
+                    style.map(".", background=[("active", "#3c3c3c")], 
+                             foreground=[("active", fg_color)])
+                    
+                    style.configure("TFrame", background=bg_color)
+                    style.configure("TLabel", background=bg_color, foreground=fg_color)
+                    style.configure("TLabelframe", background=bg_color, bordercolor=bg_color)
+                    style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+                    style.configure("Header.TLabel", background=bg_color, foreground=fg_color)
+                    
+                    style.configure("TButton", background="#3c3c3c", foreground=fg_color,
+                                  bordercolor="#3c3c3c", lightcolor="#3c3c3c", darkcolor="#3c3c3c")
+                    style.map("TButton", background=[("active", "#4c4c4c"), ("pressed", "#1e1e1e")])
+                    
+                    style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
+                    style.map("TCheckbutton", background=[("active", bg_color)])
+                    
+                    style.configure("TRadiobutton", background=bg_color, foreground=fg_color)
+                    style.map("TRadiobutton", background=[("active", bg_color)])
+                    
+                    style.configure("TNotebook", background=bg_color, bordercolor=bg_color)
+                    style.configure("TNotebook.Tab", background="#3c3c3c", foreground=fg_color)
+                    style.map("TNotebook.Tab", background=[("selected", "#4c4c4c")])
+                    
+                    style.configure("TEntry", fieldbackground="#3c3c3c", foreground=fg_color,
+                                  bordercolor=bg_color, lightcolor=bg_color, darkcolor=bg_color)
+                    
+                    self.root.configure(bg=bg_color)
+                    
+                    # Try to set title bar to dark mode (Windows 10 build 17763+)
+                    try:
+                        import ctypes
+                        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                            ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Light mode: use native Windows theme
+                    for name in ("vista", "xpnative", "winnative"):
+                        if name in style.theme_names():
+                            style.theme_use(name)
+                            break
+                    
+                    # Try to set title bar to light mode
+                    try:
+                        import ctypes
+                        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                            ctypes.byref(ctypes.c_int(0)), ctypes.sizeof(ctypes.c_int)
+                        )
+                    except Exception:
+                        pass
             
             # Minimal styling - let native theme handle colors
             style.configure("Primary.TButton", padding=(PADDING_MEDIUM, PADDING_SMALL))
             style.configure("TLabelframe.Label", font=("TkDefaultFont", 10, "bold"))
             style.configure("Header.TLabel", font=("TkDefaultFont", 16, "bold"))
-            
-            # Windows-specific theming
-            if sys.platform == "win32":
-                # On Windows, manually apply dark/light theme colors
-                try:
-                    if dark:
-                        # Dark theme colors
-                        bg_color = "#1e1e1e"
-                        fg_color = "#ffffff"
-                        select_bg = "#094771"
-                        select_fg = "#ffffff"
-                        
-                        self.root.configure(bg=bg_color)
-                        style.configure(".", background=bg_color, foreground=fg_color,
-                                      fieldbackground=bg_color, selectbackground=select_bg,
-                                      selectforeground=select_fg)
-                        style.configure("TFrame", background=bg_color)
-                        style.configure("TLabel", background=bg_color, foreground=fg_color)
-                        style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-                        style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
-                        style.configure("Header.TLabel", background=bg_color, foreground=fg_color)
-                        style.configure("TButton", background=bg_color, foreground=fg_color)
-                        style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
-                        style.configure("TRadiobutton", background=bg_color, foreground=fg_color)
-                        style.configure("TNotebook", background=bg_color, foreground=fg_color)
-                        style.configure("TNotebook.Tab", background=bg_color, foreground=fg_color)
-                        
-                        # Try to set title bar to dark mode (Windows 10 build 17763+)
-                        try:
-                            import ctypes
-                            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-                            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        # Light theme colors (system defaults)
-                        bg_color = "#f0f0f0"
-                        fg_color = "#000000"
-                        select_bg = "#0078d7"
-                        select_fg = "#ffffff"
-                        
-                        self.root.configure(bg=bg_color)
-                        style.configure(".", background=bg_color, foreground=fg_color,
-                                      fieldbackground="#ffffff", selectbackground=select_bg,
-                                      selectforeground=select_fg)
-                        style.configure("TFrame", background=bg_color)
-                        style.configure("TLabel", background=bg_color, foreground=fg_color)
-                        style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-                        style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
-                        style.configure("Header.TLabel", background=bg_color, foreground=fg_color)
-                        style.configure("TButton", background=bg_color, foreground=fg_color)
-                        style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
-                        style.configure("TRadiobutton", background=bg_color, foreground=fg_color)
-                        style.configure("TNotebook", background=bg_color, foreground=fg_color)
-                        style.configure("TNotebook.Tab", background=bg_color, foreground=fg_color)
-                        
-                        # Try to set title bar to light mode
-                        try:
-                            import ctypes
-                            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-                            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                ctypes.byref(ctypes.c_int(0)), ctypes.sizeof(ctypes.c_int)
-                            )
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
 
         def _detect_dark_mode(self) -> bool:
             try:
