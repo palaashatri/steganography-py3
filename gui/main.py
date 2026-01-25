@@ -15,6 +15,9 @@ from datetime import datetime
 from dataclasses import dataclass
 import logging
 
+# Add parent directory to path to find stego module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # Core steganography operations imported from stego package
 from stego import (
     load_image,
