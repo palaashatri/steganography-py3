@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ['3.11']
+        python-version: ['3.14']
     
     steps:
     - uses: actions/checkout@v4
@@ -48,10 +48,14 @@ jobs:
     
     - name: Run tests (Linux with Xvfb)
       if: runner.os == 'Linux'
+      env:
+        PYTHONPATH: ${{ github.workspace }}
       run: xvfb-run -a pytest -v --cov=. --cov-report=xml --cov-report=term
     
     - name: Run tests (macOS/Windows)
       if: runner.os != 'Linux'
+      env:
+        PYTHONPATH: ${{ github.workspace }}
       run: pytest -v --cov=. --cov-report=xml --cov-report=term
     
     - name: Upload coverage
