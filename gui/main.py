@@ -280,7 +280,6 @@ def gui_main() -> None:
             self.root.geometry("1400x920")
             self.root.minsize(1100, 750)
             self.history: list[HistoryItem] = []
-            self.dark_mode = tk.BooleanVar(master=self.root, value=self._detect_dark_mode())
             self.preview_visible = tk.BooleanVar(master=self.root, value=True)
             self.recent_files: list[str] = []
             self.preferences = self._load_preferences()
@@ -292,35 +291,23 @@ def gui_main() -> None:
                 except Exception:
                     pass
             
-            self._apply_native_theme()
+            # Build UI first, then apply theme
             self._build_ui()
-            self._apply_theme(self.dark_mode.get())
+            self._apply_native_theme()
             self._setup_keyboard_shortcuts()
             
             # Save window geometry on close
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         def _apply_native_theme(self) -> None:
-            style = ttk.Style()
-            if sys.platform == "win32":
-                for name in ("vista", "xpnative", "winnative"):
-                    if name in style.theme_names():
-                        style.theme_use(name)
-                        return
-            elif sys.platform == "darwin":
-                if "aqua" in style.theme_names():
-                    style.theme_use("aqua")
-                    return
-            style.theme_use(style.theme_use())
-
-        def _apply_theme(self, dark: bool) -> None:
+            """Apply native OS theme with dark mode detection."""
             style = ttk.Style()
             
-            # Update appearance based on dark mode preference
             if sys.platform == "darwin":
-                # On macOS, set the appearance mode
+                # Detect macOS dark mode and apply appearance
+                dark_mode = self._detect_dark_mode()
                 try:
-                    appearance = "darkAqua" if dark else "aqua"
+                    appearance = "darkAqua" if dark_mode else "aqua"
                     self.root.tk.call("::tk::unsupported::MacWindowStyle", "appearance", self.root._w, appearance)
                 except Exception:
                     pass
@@ -330,9 +317,11 @@ def gui_main() -> None:
                     style.theme_use("aqua")
                     
             elif sys.platform == "win32":
-                # Windows: Use alt theme for dark mode, default theme for light mode
-                if dark:
-                    # Try to use alt theme which is darker on Windows
+                # Detect Windows dark mode
+                dark_mode = self._detect_dark_mode()
+                
+                if dark_mode:
+                    # Use alt/clam theme for better dark mode support
                     if "alt" in style.theme_names():
                         style.theme_use("alt")
                     elif "clam" in style.theme_names():
@@ -393,20 +382,8 @@ def gui_main() -> None:
                         if name in style.theme_names():
                             style.theme_use(name)
                             break
-                    
-                    # Try to set title bar to light mode
-                    try:
-                        import ctypes
-                        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-                        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                            ctypes.byref(ctypes.c_int(0)), ctypes.sizeof(ctypes.c_int)
-                        )
-                    except Exception:
-                        pass
             
-            # Minimal styling - let native theme handle colors
+            # Apply standard styling
             style.configure("Primary.TButton", padding=(PADDING_MEDIUM, PADDING_SMALL))
             style.configure("TLabelframe.Label", font=("TkDefaultFont", 10, "bold"))
             style.configure("Header.TLabel", font=("TkDefaultFont", 16, "bold"))
@@ -613,7 +590,7 @@ Tips:
             win.transient(self.root)
             
             # Apply theme based on mode
-            if self.dark_mode.get():
+            if self._detect_dark_mode():
                 win.configure(bg="#2b2d31")
                 text = tk.Text(win, wrap=tk.WORD, padx=PADDING_MEDIUM, pady=PADDING_MEDIUM,
                              bg="#2b2d31", fg="#dcddde", insertbackground="#dcddde", borderwidth=0)
@@ -697,7 +674,7 @@ Tips:
             settings.grab_set()
             
             # Apply theme colors to toplevel window
-            if self.dark_mode.get():
+            if self._detect_dark_mode():
                 settings.configure(bg="#2b2d31")
             else:
                 settings.configure(bg="SystemButtonFace")
@@ -733,8 +710,8 @@ Tips:
             notebook.add(appearance, text="Appearance")
             
             ttk.Label(appearance, text="Theme:").pack(anchor=tk.W, padx=PADDING_MEDIUM, pady=(PADDING_MEDIUM, 0))
-            ttk.Checkbutton(appearance, text="Dark mode", variable=self.dark_mode, 
-                          command=lambda: self._apply_theme(self.dark_mode.get())).pack(anchor=tk.W, padx=PADDING_MEDIUM)
+            ttk.Label(appearance, text="Using system theme (Light/Dark mode)", 
+                     foreground="gray").pack(anchor=tk.W, padx=PADDING_MEDIUM)
             
             # Save button
             btn_frame = ttk.Frame(settings)
@@ -2701,7 +2678,7 @@ Tips:
             win.geometry("700x400")
             
             # Apply theme based on mode
-            if self.dark_mode.get():
+            if self._detect_dark_mode():
                 win.configure(bg="#2b2d31")
                 txt = tk.Text(win, wrap=tk.WORD, bg="#1e1f22", fg="#dcddde", 
                             insertbackground="#dcddde", borderwidth=0, padx=8, pady=8)
